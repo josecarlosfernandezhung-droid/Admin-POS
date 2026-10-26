@@ -1,0 +1,9 @@
+{
+  "appId": "com.tototools.adminpos",
+  "appName": "Admin POS",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  }
+}

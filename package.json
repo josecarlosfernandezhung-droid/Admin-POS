@@ -1,0 +1,39 @@
+{
+  "name": "admin-pos",
+  "version": "1.0.0",
+  "description": "Admin POS: ventas, inventario, caja y control desde MariaDB",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "servidor": "node server/start.mjs",
+    "pc": "electron .",
+    "pc:exe": "electron-builder --win portable --publish never"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.3"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/cli": "^6.2.0",
+    "@capacitor/core": "^6.2.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.tototools.adminpos",
+    "productName": "Admin POS",
+    "files": [
+      "electron/**",
+      "server/**",
+      "www/**",
+      "build/icon.png",
+      "package.json"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "build/icon.ico",
+      "artifactName": "Admin-POS.exe"
+    }
+  }
+}

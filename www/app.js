@@ -429,6 +429,15 @@ vistas.resumen = async (silencio) => {
       ${d.anterior ? `<span class="chip ${claseVar(d.anterior.variacion)}">${d.anterior.variacion == null ? "Sin datos del período anterior" : signo(d.anterior.variacion) + " frente al período anterior"}</span>` : ""}
       <div class="mini"><div><span>Tickets</span><b class="num">${fmt(d.tickets, 0)}</b></div><div><span>Promedio</span><b class="num">${compacto(d.promedio)}</b></div>
         <div><span>Devoluciones</span><b class="num">${compacto(d.devoluciones)}</b><small>${d.devDocs} docs.</small></div></div></div>
+    ${solo ? "" : `<div class="tarjeta"><h3>Costos y ganancia <small>según costo de ficha / operación</small></h3>
+      <div class="kpis">
+        <div class="kpi"><span>Ventas</span><b class="num">${cup(d.total)}</b></div>
+        <div class="kpi"><span>Descuentos</span><b class="num">${cup(d.descuentos || 0)}</b></div>
+        <div class="kpi"><span>Costo de lo vendido</span><b class="num">${cup(d.costo || 0)}</b></div>
+        <div class="kpi"><span>Ganancia bruta</span><b class="num" style="color:var(--verde)">${cup(d.ganancia || 0)}</b>
+          <small>Margen ${fmt((d.margen || 0) * 100, 1)} % · Costo × $1: ${fmt(d.costoPorPeso || 0, 2)}</small></div>
+      </div>
+      <p class="muted" style="margin:8px 0 0;font-size:.84rem">El costo usa el precio de costo de cada línea (o el de la ficha del producto). Si en AxisPOS muchos artículos no tienen costo cargado, la ganancia saldrá inflada.</p></div>`}
     <div class="tarjeta"><h3>Tiempo real <small>último día con ventas: ${diaLargo(tr.dia)}</small></h3><div class="rt">
       <div><span>Ese día</span><b class="num">${cup(tr.hoy)}</b>${vc(tr.varDia, "vs día anterior")}<span>${tr.hoyTickets} tickets</span></div>
       <div><span>Últimos 7 días</span><b class="num">${cup(tr.semana)}</b>${vc(tr.varSemana, "vs 7 días antes")}</div>
@@ -440,8 +449,12 @@ vistas.resumen = async (silencio) => {
     <div class="tarjeta"><h3>Promedio por día de la semana</h3>${graficaDiaSemana(d.porDia)}<p class="muted" style="margin:8px 0 0;font-size:.84rem">Promedio de ventas de cada día de la semana en el período seleccionado.</p></div>
     <div class="tarjeta"><h3>Lo más vendido</h3><div class="scroll"><table><tr><th>Artículo</th><th>Familia</th><th class="d">Unid.</th><th class="d">Importe</th></tr>
       ${d.top.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.familia)}</td><td class="d num">${fmt(x.unidades, 0)}</td><td class="d num">${compacto(x.total)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">Sin ventas en este período</td></tr>'}</table></div></div>
-    <div class="tarjeta"><h3>Familias</h3>${d.familias.map((f) => hbar(f.familia, f.total, maxFam, compacto(f.total))).join("") || '<p class="muted">Sin datos</p>'}</div>
-    ${solo ? "" : `<div class="tarjeta"><h3>Cajeros</h3>${d.cajeros.map((c) => `<div class="fila"><div>${e(c.nombre)}<small>${ROL[c.rol] || ""}</small></div><div class="d num">${compacto(c.total)} · ${fmt(c.tickets, 0)}</div></div>`).join("") || '<p class="muted">Sin datos</p>'}</div>`}
+    <div class="tarjeta"><h3>Venta por grupo / familia</h3>
+      ${d.familias.map((f) => hbar(f.familia, f.total, maxFam, compacto(f.total))).join("") || '<p class="muted">Sin datos</p>'}
+      <div class="scroll" style="margin-top:12px"><table><tr><th>Grupo</th><th class="d">Unid.</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">%</th><th class="d">Ventas</th></tr>
+      ${d.familias.map((f) => `<tr><td>${e(f.familia)}</td><td class="d num">${fmt(f.unidades || 0, 0)}</td><td class="d num">${compacto(f.costo || 0)}</td><td class="d num">${compacto(f.ganancia || 0)}</td><td class="d num">${fmt((f.parte || 0) * 100, 1)} %</td><td class="d num"><b>${compacto(f.total)}</b></td></tr>`).join("")}
+      </table></div></div>
+    ${solo ? "" : `<div class="tarjeta"><h3>Ventas por trabajador</h3>${d.cajeros.map((c) => `<div class="fila"><div>${e(c.nombre)}<small>${ROL[c.rol] || ""} · ${fmt(c.tickets, 0)} tickets${c.devoluciones ? ` · dev. ${compacto(c.devoluciones)}` : ""}</small></div><div class="d num"><b>${compacto(c.total)}</b></div></div>`).join("") || '<p class="muted">Sin datos</p>'}</div>`}
     <div class="tarjeta"><h3>Últimos tickets <small><button class="link" data-act="ir" data-v="ventas">Ver todos</button></small></h3>
       ${d.recientes.map((t) => `<div class="fila clic" data-act="ticket" data-acct="${t.acct}" style="cursor:pointer"><div><span class="link">${t.ticket}</span><small>${fechaHora(t.fecha)} · ${e(t.cajero || "")}</small></div><div class="d num">${cup(t.total)}</div></div>`).join("") || '<p class="muted">Sin tickets</p>'}</div>`;
   // Montar gráficas interactivas (Chart.js)
@@ -612,7 +625,13 @@ const TIPO_ALERTA = { agotado: "Agotado", minimo: "Bajo mínimo", reorden: "Repo
 
 vistas.inventario = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["alertas", "Alertas de stock"], ["abc", "Análisis ABC"], ["compras", "Compras sugeridas"]], S.invSub, "invSub");
+  const tabs = subTabs([
+    ["alertas", "Alertas"],
+    ["ipv", "IPV"],
+    ["traspasos", "Traspasos"],
+    ["abc", "ABC"],
+    ["compras", "Compras"],
+  ], S.invSub, "invSub");
   let cuerpo = "";
   if (S.invSub === "alertas") {
     const d = await get("/api/alertas");
@@ -620,6 +639,74 @@ vistas.inventario = async () => {
       <div class="tarjeta"><h3>Productos en alerta <small>${d.total} en total</small></h3><p class="muted" style="margin:-4px 0 8px;font-size:.84rem">Se calcula con las ventas de los últimos ${d.ventana} días. Punto de reposición = venta diaria × (${d.plazo} días de entrega + ${d.seguridad} de seguridad). Puedes cambiar estos números en Ajustes.</p>
       ${d.filas.map((x) => `<div class="fila"><div>${e(x.nombre)}<small>${e(x.familia)}${x.clase !== "-" ? " · clase " + x.clase : ""}${x.minimo > 0 ? " · mínimo " + fmt(x.minimo, 0) : ""}</small></div>
         <div class="d"><span class="etiqueta et-${x.tipo}">${TIPO_ALERTA[x.tipo]}</span><small>Stock ${fmt(x.stock, 1)} · vende ${fmt(x.diaria, 1)}/día${x.cobertura != null ? ` · alcanza ${fmt(x.cobertura, 1)} d` : ""}</small></div></div>`).join("") || '<p class="muted">No hay productos en alerta. Todo en orden.</p>'}</div>`;
+  } else if (S.invSub === "ipv") {
+    const d = await get("/api/ipv", paramsPeriodo({ q: S.exis.q || "", local: S.exis.local || "" }));
+    if (!aqui(tk)) return;
+    const r = d.resumen;
+    cuerpo = `<div class="kpis">
+        <div class="kpi"><span>Existencia inicial</span><b class="num">${fmt(r.inicio, 0)}</b><small>valor ~ ${cup(r.valorInicio)}</small></div>
+        <div class="kpi"><span>Entradas</span><b class="num">${fmt(r.entradas, 0)}</b></div>
+        <div class="kpi"><span>Ventas</span><b class="num">${fmt(r.ventas, 0)}</b><small>${cup(r.importeVentas)}</small></div>
+        <div class="kpi"><span>Existencia final</span><b class="num">${fmt(r.final, 0)}</b><small>valor ~ ${cup(r.valorFinal)}</small></div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><span>Devoluciones</span><b class="num">${fmt(r.devoluciones, 0)}</b></div>
+        <div class="kpi"><span>Mermas / bajas</span><b class="num">${fmt(r.mermas, 0)}</b></div>
+        <div class="kpi"><span>Productos en el IPV</span><b class="num">${fmt(r.productos, 0)}</b></div>
+      </div>
+      <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Buscar producto" value="${e(S.exis.q)}" data-in="buscaExis">
+        <select data-in="localExis"><option value="">Todos los locales</option>${d.locales.map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.local) ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}</select>
+        <button class="btn sec" data-act="invSub" data-v="ipv">Aplicar</button></div>
+        <p class="muted" style="margin:0 0 8px;font-size:.84rem">Período ${diaLargo(d.desde)} – ${diaLargo(d.hasta)}. Inicial = stock actual − movimientos del período (reconstruido desde AxisPOS).</p>
+        <h3>Movimiento de mercancías por producto</h3>
+        <div class="scroll"><table>
+          <tr><th>Producto</th><th class="d">Inicio</th><th class="d">Entradas</th><th class="d">Ventas</th><th class="d">Dev.</th><th class="d">Mermas</th><th class="d">Final</th><th class="d">\$ ventas</th></tr>
+          ${d.filas.map((x) => `<tr>
+            <td>${e(x.nombre)}<small>${e(x.familia)}${x.codigo ? " · " + e(x.codigo) : ""}</small></td>
+            <td class="d num">${fmt(x.inicio, 1)}</td>
+            <td class="d num">${x.entradas ? fmt(x.entradas, 1) : "—"}</td>
+            <td class="d num">${x.ventas ? fmt(x.ventas, 1) : "—"}</td>
+            <td class="d num">${x.devoluciones ? fmt(x.devoluciones, 1) : "—"}</td>
+            <td class="d num">${x.mermas ? fmt(x.mermas, 1) : "—"}</td>
+            <td class="d num"><b>${fmt(x.final, 1)}</b></td>
+            <td class="d num">${x.importeVentas ? compacto(x.importeVentas) : "—"}</td>
+          </tr>`).join("") || '<tr><td colspan="8" class="muted">Sin movimientos ni stock en el filtro</td></tr>'}
+        </table></div></div>
+      <div class="tarjeta"><h3>Tipos de movimiento en el período</h3>
+        <div class="scroll"><table><tr><th>Tipo</th><th class="d">Operaciones</th><th class="d">Unidades</th><th class="d">Importe</th></tr>
+        ${(d.tiposMovimiento || []).map((t) => `<tr><td>${e(t.nombre)} <small class="muted">(${t.tipo})</small></td><td class="d num">${fmt(t.n, 0)}</td><td class="d num">${fmt(t.volumen, 1)}</td><td class="d num">${t.importe ? compacto(t.importe) : "—"}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">Sin movimientos</td></tr>'}
+        </table></div></div>
+      <div class="tarjeta"><h3>Stock actual por local (valorado)</h3>
+        <div class="scroll"><table><tr><th>Local</th><th class="d">Refs.</th><th class="d">Piezas</th><th class="d">Valor costo</th><th class="d">Valor venta</th></tr>
+        ${d.porLocal.map((x) => `<tr><td>${e(x.local)}</td><td class="d num">${fmt(x.refs, 0)}</td><td class="d num">${fmt(x.piezas, 1)}</td><td class="d num">${cup(x.costo)}</td><td class="d num">${cup(x.venta)}</td></tr>`).join("")}
+        </table></div></div>`;
+  } else if (S.invSub === "traspasos") {
+    const d = await get("/api/traspasos", paramsPeriodo());
+    if (!aqui(tk)) return;
+    cuerpo = `<div class="kpis">
+        <div class="kpi"><span>Productos a mover</span><b class="num">${fmt(d.resumen.productos, 0)}</b><small>${d.resumen.altas} urgencia alta</small></div>
+        <div class="kpi"><span>Unidades sugeridas</span><b class="num">${fmt(d.resumen.unidades, 0)}</b></div>
+        <div class="kpi"><span>Valor a costo</span><b class="num">${cup(d.resumen.valorCosto)}</b></div>
+        <div class="kpi"><span>Cobertura objetivo</span><b class="num">${d.diasObjetivo} días</b><small>según ventas ${d.dias} d</small></div>
+      </div>
+      <div class="tarjeta"><h3>Cómo se calcula</h3>
+        <p class="muted" style="margin:0;font-size:.86rem">
+          <b>Punto de venta:</b> ${d.puntosVenta.map((x) => e(x.nombre)).join(", ") || "—"} (locales con ventas en el período).<br>
+          <b>Almacén:</b> ${d.almacenes.map((x) => e(x.nombre)).join(", ") || "—"} (locales con stock y poca o ninguna venta).<br>
+          Se sugiere traspasar lo necesario para cubrir <b>${d.diasObjetivo} días</b> de venta en el punto de venta, sin pasar de lo que hay en almacén.
+        </p></div>
+      <div class="tarjeta"><h3>Sugerencias de traspaso almacén → punto de venta</h3>
+        <div class="scroll"><table><tr><th>Producto</th><th class="d">Venta/día</th><th class="d">En PV</th><th class="d">En almacén</th><th class="d">Cubre</th><th class="d">Mover</th><th>Urgencia</th></tr>
+        ${d.filas.map((x) => `<tr>
+          <td>${e(x.nombre)}<small>${e(x.familia)} · de ${e(x.desde)} → ${e(x.hacia)}</small></td>
+          <td class="d num">${fmt(x.diaria, 1)}</td>
+          <td class="d num">${fmt(x.enPv, 1)}</td>
+          <td class="d num">${fmt(x.enAlm, 1)}</td>
+          <td class="d num">${fmt(x.coberturaPv, 1)} d</td>
+          <td class="d num"><b>${fmt(x.sugerido, 1)}</b></td>
+          <td><span class="etiqueta et-${x.urgencia === "alta" ? "alta" : x.urgencia === "media" ? "media" : "ok"}">${x.urgencia}</span></td>
+        </tr>`).join("") || '<tr><td colspan="7" class="muted">Nada urgente que mover: el punto de venta tiene cobertura suficiente o no hay stock en almacén.</td></tr>'}
+        </table></div></div>`;
   } else if (S.invSub === "abc") {
     const d = await get("/api/abc", { clase: S.abcClase });
     const nombres = { A: "Clase A · alta rotación", B: "Clase B · media", C: "Clase C · baja", S: "Sin movimiento" };
@@ -636,7 +723,7 @@ vistas.inventario = async () => {
       <div class="scroll"><table><tr><th>Producto</th><th>Clase</th><th class="d">Stock</th><th class="d">Alcanza</th><th class="d">Pedir</th><th class="d">Costo est.</th></tr>
       ${d.filas.map((x) => `<tr><td>${e(x.nombre)}</td><td>${x.clase}</td><td class="d num">${fmt(x.stock, 1)}</td><td class="d num">${x.cobertura != null ? fmt(x.cobertura, 1) + " d" : "—"}</td><td class="d num"><b>${fmt(x.pedir, 0)}</b></td><td class="d num">${x.estimado != null ? compacto(x.estimado) : "—"}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Nada por pedir por ahora</td></tr>'}</table></div></div>`;
   }
-  if (aqui(tk)) $("#contenido").innerHTML = `${cab("Inventario", "")}${tabs}${cuerpo}`;
+  if (aqui(tk)) $("#contenido").innerHTML = `${cab("Inventario", "Alertas, IPV valorado, traspasos almacén→PV, ABC y compras.")}${tabs}${cuerpo}`;
 };
 
 // ---------- Pérdidas ----------
@@ -838,8 +925,16 @@ const ENT = {
   famProd: (el) => { S.prod.familia = el.value; S.prod.pagina = 1; recargarProd(); },
   ordenProd: (el) => { S.prod.orden = el.value; S.prod.pagina = 1; recargarProd(); },
   activosProd: (el) => { S.prod.activos = el.checked; S.prod.pagina = 1; recargarProd(); },
-  buscaExis: (el) => { S.exis.q = el.value; S.exis.pagina = 1; recargarExis(); },
-  localExis: (el) => { S.exis.local = el.value; S.exis.pagina = 1; recargarExis(); },
+  buscaExis: (el) => {
+    S.exis.q = el.value; S.exis.pagina = 1;
+    if (S.vista === "inventario" && S.invSub === "ipv") vista(true);
+    else recargarExis();
+  },
+  localExis: (el) => {
+    S.exis.local = el.value; S.exis.pagina = 1;
+    if (S.vista === "inventario" && S.invSub === "ipv") vista(true);
+    else recargarExis();
+  },
   tipoEv: (el) => { S.ev.tipo = el.value; S.ev.pagina = 1; vista(true); },
   rolUsuario: async (el) => { try { await post("/api/ajustes/rol", { id: el.dataset.id, rol: el.value }); aviso("Rol cambiado"); } catch (err) { aviso(err.message); vista(true); } },
 };

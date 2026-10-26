@@ -1,0 +1,57 @@
+name: Compilar Admin POS
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  android:
+    name: APK para Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Instalar dependencias
+        run: npm install --no-audit --no-fund
+      - name: Crear proyecto Android
+        run: npx cap add android
+      - name: Poner el ícono de Admin POS
+        run: |
+          find android/app/src/main/res -name 'ic_launcher*.webp' -delete
+          cp -r resources/android/. android/app/src/main/res/
+      - name: Permitir conexión por WiFi local (http)
+        run: sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
+      - name: Sincronizar
+        run: npx cap sync android
+      - name: Compilar APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Admin-POS-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  windows:
+    name: Programa para Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Instalar dependencias
+        run: npm install --no-audit --no-fund
+      - name: Compilar .exe
+        run: npx electron-builder --win portable --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Admin-POS-windows
+          path: dist/Admin-POS.exe
+          

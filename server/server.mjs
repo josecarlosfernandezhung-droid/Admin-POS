@@ -267,7 +267,7 @@ const MODULO = {
   resumen: "resumen", ventas: "ventas", ticket: "ventas", "ventas-dia": "ventas",
   productos: "productos", top: "productos", "prod-tx": "productos",
   existencias: "existencias", caja: "caja", equipo: "equipo",
-  alertas: "inventario", abc: "inventario", compras: "inventario",
+  alertas: "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", traspasos: "inventario",
   anomalias: "perdidas", eventos: "perdidas", mermas: "perdidas", auditoria: "perdidas",
 };
 
@@ -291,6 +291,8 @@ async function consulta(res, nombre, s, p, q) {
     case "alertas": datos = await Q.alertasStock(p, ctx); break;
     case "abc": datos = await Q.analisisABC(p, ctx, q); break;
     case "compras": datos = await Q.sugerenciasCompra(p, ctx); break;
+    case "ipv": datos = await Q.ipv(p, ctx, q); break;
+    case "traspasos": datos = await Q.traspasos(p, ctx, q); break;
     case "anomalias": datos = await Q.anomalias(p, ctx); break;
     case "eventos": datos = await Q.eventos(p, ctx, q); break;
     case "mermas": datos = await Q.mermas(p, ctx); break;

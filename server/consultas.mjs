@@ -101,7 +101,10 @@ export async function resumen(pool, ctx) {
   const mesAntIni = ymd(new Date(Date.UTC(Number(ultimo.slice(0, 4)), Number(ultimo.slice(5, 7)) - 2, 1)));
   const mesAntMismoDia = sumarDias(mesAntIni, diaMes - 1);
   const mesAntFin = sumarDias(inicioMes, -1);
-  const [tot, dev, ant, horas, dias, top, fam, formas, rec, hoyT, ayerT, sem, semAnt, mes, mesAnt, hoyHoras, cajeros] =
+  // Costo de lo vendido y descuentos en importe (estilo resumen del PDF)
+  const COSTO = "ABS(o.Qtty) * COALESCE(NULLIF(o.PriceIn,0), NULLIF(g.PriceIn,0), 0)";
+  const DESC_IMP = "(ABS(o.Qtty) * o.PriceOut * IF(o.Discount BETWEEN 0 AND 100, o.Discount, 0) / 100)";
+  const [tot, dev, ant, horas, dias, top, fam, formas, rec, hoyT, ayerT, sem, semAnt, mes, mesAnt, hoyHoras, cajeros, costoDesc] =
     await Promise.all([
       una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS tickets, COALESCE(SUM(ABS(o.Qtty)),0) AS unidades FROM operations o WHERE ${VENTA} AND ${RANGO}${U}`, P),
       una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS docs FROM operations o WHERE ${DEVOL} AND ${RANGO}${U}`, P),
@@ -110,10 +113,11 @@ export async function resumen(pool, ctx) {
       filas(pool, `SELECT DATE_FORMAT(${F},'%Y-%m-%d') AS dia, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} AND ${RANGO}${U} GROUP BY dia ORDER BY dia`, P),
       filas(pool, `SELECT g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia, SUM(ABS(o.Qtty)) AS unidades, SUM(${IMP}) AS total
         FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-        WHERE ${VENTA} AND ${RANGO}${U} GROUP BY o.GoodID, g.Name, gg.Name ORDER BY total DESC LIMIT 10`, P),
-      filas(pool, `SELECT COALESCE(gg.Name,'Sin grupo') AS familia, SUM(${IMP}) AS total
+        WHERE ${VENTA} AND ${RANGO}${U} GROUP BY o.GoodID, g.Name, gg.Name ORDER BY total DESC LIMIT 15`, P),
+      filas(pool, `SELECT COALESCE(gg.Name,'Sin grupo') AS familia,
+            SUM(${IMP}) AS total, SUM(ABS(o.Qtty)) AS unidades, SUM(${COSTO}) AS costo
         FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-        WHERE ${VENTA} AND ${RANGO}${U} GROUP BY gg.ID, gg.Name ORDER BY total DESC LIMIT 12`, P),
+        WHERE ${VENTA} AND ${RANGO}${U} GROUP BY gg.ID, gg.Name ORDER BY total DESC`, P),
       filas(pool, `SELECT COALESCE(p.Company,'Sin socio') AS socio, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total
         FROM operations o LEFT JOIN partners p ON p.ID = o.PartnerID WHERE ${VENTA} AND ${RANGO}${U} GROUP BY p.ID, p.Company ORDER BY total DESC`, P),
       filas(pool, `SELECT o.Acct AS acct, MAX(${F}) AS fecha, SUM(${IMP}) AS total, MAX(u.Name) AS cajero
@@ -127,23 +131,38 @@ export async function resumen(pool, ctx) {
       totalVentas(pool, ctx, mesAntIni, mesAntMismoDia),
       porHora(pool, ctx, ultimo, ultimo),
       ctx.uid != null ? Promise.resolve([]) : equipo(pool, { ...ctx, r: ctx.r }),
+      una(pool, `SELECT COALESCE(SUM(${COSTO}),0) AS costo, COALESCE(SUM(${DESC_IMP}),0) AS descuentos
+        FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID WHERE ${VENTA} AND ${RANGO}${U}`, P),
     ]);
   const mesAntCompleto = await totalVentas(pool, ctx, mesAntIni, mesAntFin);
   const total = num(tot.total);
   const tickets = num(tot.tickets);
+  const costo = num(costoDesc.costo);
+  const descuentos = num(costoDesc.descuentos);
+  const ganancia = total - costo;
   const pct = (a, b) => (b > 0 ? redondear(((a - b) / b) * 100, 1) : null);
   return {
     desde, hasta, dias: ctx.r.dias, ultimoDia: ultimo,
     total, tickets, unidades: num(tot.unidades), promedio: tickets ? total / tickets : 0,
     devoluciones: num(dev.total), devDocs: num(dev.docs), neto: total - num(dev.total),
+    costo, descuentos, ganancia,
+    margen: total > 0 ? ganancia / total : 0,
+    costoPorPeso: total > 0 ? costo / total : 0,
     anterior: ant ? { total: ant.total, tickets: ant.tickets, variacion: pct(total, ant.total) } : null,
     porHora: horas.map((x) => ({ hora: num(x.hora), total: num(x.total), tickets: num(x.tickets) })),
     porDia: dias.map((x) => ({ dia: x.dia, total: num(x.total), tickets: num(x.tickets) })),
     top: top.map((x) => ({ nombre: x.nombre, familia: x.familia, unidades: num(x.unidades), total: num(x.total) })),
-    familias: fam.map((x) => ({ familia: x.familia, total: num(x.total) })),
+    familias: fam.map((x) => ({
+      familia: x.familia,
+      total: num(x.total),
+      unidades: num(x.unidades),
+      costo: num(x.costo),
+      ganancia: num(x.total) - num(x.costo),
+      parte: total > 0 ? num(x.total) / total : 0,
+    })),
     formasPago: formas.map((x) => ({ socio: x.socio, tickets: num(x.tickets), total: num(x.total) })),
     recientes: rec.map((x) => ({ ticket: numTicket(x.acct), acct: num(x.acct), fecha: x.fecha, total: num(x.total), cajero: x.cajero })),
-    cajeros: (cajeros || []).slice(0, 8),
+    cajeros: (cajeros || []).slice(0, 12),
     tiempoReal: {
       dia: ultimo, hoy: hoyT.total, hoyTickets: hoyT.tickets, ayer: ayerT.total, varDia: pct(hoyT.total, ayerT.total),
       semana: sem.total, semanaAnt: semAnt.total, varSemana: pct(sem.total, semAnt.total),
@@ -467,6 +486,432 @@ export async function existencias(pool, ctx, q) {
     locales: locales.map((x) => ({ id: x.id, nombre: x.nombre + (num(x.archivado) !== 0 ? " (archivado)" : "") })),
     total: n, paginas: Math.max(Math.ceil(n / 40), 1), pagina,
     filas: lista.map((x) => ({ id: x.id, nombre: x.nombre, local: x.local, cantidad: num(x.cantidad) })),
+  };
+}
+
+// ---------- IPV detallado (inventario valorado por local) ----------
+// Nombres legibles de tipos de operación típicos de AxisPOS / Microinvest
+const NOMBRE_OPER = {
+  1: "Entrada / compra",
+  2: "Venta",
+  3: "Merma / desecho",
+  4: "Pedido",
+  7: "Transferencia",
+  8: "Producción",
+  11: "Baja / uso interno",
+  12: "Recepción",
+  15: "Inventario / ajuste",
+  26: "Transferencia salida",
+  27: "Transferencia entrada",
+  34: "Devolución de venta",
+  35: "Devolución a proveedor",
+};
+
+export async function ipv(pool, ctx, q) {
+  const { desde, hasta } = ctx.r;
+  const busca = `%${String(q.q || "").trim().slice(0, 60)}%`;
+  const local = parseInt(q.local, 10);
+  const tieneLocal = Number.isInteger(local);
+
+  // --- Stock actual (existencia final) por producto ---
+  const stockParams = [busca, busca, busca];
+  let stockFiltro = " AND COALESCE(g.Deleted,0) = 0";
+  if (tieneLocal) {
+    stockFiltro += " AND s.ObjectID = ?";
+    stockParams.push(local);
+  }
+  const filasStock = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
+            SUM(s.Qtty) AS final, g.PriceIn AS costoUnit, ${PRECIO} AS precioUnit
+     FROM store s
+     JOIN goods g ON g.ID = s.GoodID
+     LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
+     WHERE (g.Name LIKE ? OR g.Code LIKE ? OR g.BarCode1 LIKE ?)${stockFiltro}
+     GROUP BY g.ID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3`,
+    stockParams
+  );
+  const stockMap = new Map(filasStock.map((x) => [num(x.id), x]));
+
+  // --- Movimientos del período por producto y tipo ---
+  // Qtty en AxisPOS: ventas suelen ser negativas; usamos el signo real para reconstruir
+  const movParams = [desde, hasta, busca, busca, busca];
+  let movLocal = "";
+  // Filtrar por local vía turno si se pide
+  if (tieneLocal) {
+    movLocal = " AND EXISTS (SELECT 1 FROM shift sh WHERE sh.ID = o.ShiftID AND sh.ObjectID = ?)";
+    movParams.push(local);
+  }
+  const movs = await filas(
+    pool,
+    `SELECT o.GoodID AS id, o.OperType AS tipo,
+            SUM(o.Qtty) AS neto,
+            SUM(ABS(o.Qtty)) AS volumen,
+            SUM(${IMP}) AS importe,
+            COUNT(*) AS n
+     FROM operations o
+     JOIN goods g ON g.ID = o.GoodID
+     WHERE ${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY)
+       AND (g.Name LIKE ? OR g.Code LIKE ? OR g.BarCode1 LIKE ?)
+       ${movLocal}
+     GROUP BY o.GoodID, o.OperType`,
+    movParams
+  );
+
+  // Resumen global por tipo de movimiento
+  const tiposAgg = {};
+  // Por producto: acumular por clase de movimiento
+  const porProd = new Map();
+
+  const ensure = (id) => {
+    if (!porProd.has(id)) {
+      const s = stockMap.get(id);
+      porProd.set(id, {
+        id,
+        codigo: s?.codigo || "",
+        nombre: s?.nombre || `Producto ${id}`,
+        familia: s?.familia || "",
+        costoUnit: num(s?.costoUnit),
+        precioUnit: num(s?.precioUnit),
+        final: num(s?.final),
+        ventas: 0,
+        devoluciones: 0,
+        entradas: 0,
+        mermas: 0,
+        transferencias: 0,
+        otros: 0,
+        netoMov: 0, // suma de Qtty firmada en el período
+        importeVentas: 0,
+        tipos: {},
+      });
+    }
+    return porProd.get(id);
+  };
+
+  // Incluir productos que tienen stock aunque no se movieron
+  for (const [id] of stockMap) ensure(id);
+
+  for (const m of movs) {
+    const id = num(m.id);
+    const tipo = num(m.tipo);
+    const row = ensure(id);
+    if (!row.nombre || row.nombre.startsWith("Producto ")) {
+      // Completar nombre si solo había movimiento
+      // (se rellena abajo con consulta si hace falta)
+    }
+    const vol = num(m.volumen);
+    const neto = num(m.neto);
+    row.netoMov += neto;
+    row.tipos[tipo] = { tipo, nombre: NOMBRE_OPER[tipo] || `Tipo ${tipo}`, volumen: vol, neto, importe: num(m.importe), n: num(m.n) };
+
+    if (!tiposAgg[tipo]) tiposAgg[tipo] = { tipo, nombre: NOMBRE_OPER[tipo] || `Tipo ${tipo}`, volumen: 0, importe: 0, n: 0 };
+    tiposAgg[tipo].volumen += vol;
+    tiposAgg[tipo].importe += num(m.importe);
+    tiposAgg[tipo].n += num(m.n);
+
+    if (tipo === 2) {
+      row.ventas += vol;
+      row.importeVentas += num(m.importe);
+    } else if (tipo === 34) {
+      row.devoluciones += vol;
+    } else if (tipo === 1 || tipo === 12 || tipo === 27 || tipo === 35) {
+      row.entradas += vol;
+    } else if (tipo === 3 || tipo === 11) {
+      row.mermas += vol;
+    } else if (tipo === 7 || tipo === 26) {
+      row.transferencias += vol;
+    } else {
+      row.otros += vol;
+    }
+  }
+
+  // Completar nombres de productos solo con movimiento
+  const faltan = [...porProd.values()].filter((p) => !p.nombre || p.nombre.startsWith("Producto ")).map((p) => p.id);
+  if (faltan.length) {
+    const nombres = await filas(
+      pool,
+      `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia, g.PriceIn AS costoUnit, ${PRECIO} AS precioUnit
+       FROM goods g LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID WHERE g.ID IN (${faltan.map(() => "?").join(",")})`,
+      faltan
+    );
+    for (const n of nombres) {
+      const row = porProd.get(num(n.id));
+      if (row) {
+        row.codigo = n.codigo;
+        row.nombre = n.nombre;
+        row.familia = n.familia;
+        row.costoUnit = num(n.costoUnit);
+        row.precioUnit = num(n.precioUnit);
+      }
+    }
+  }
+
+  // Existencia inicial = final − neto de movimientos del período
+  // (neto = suma de Qtty firmadas; ventas restan, entradas suman)
+  const filasMov = [...porProd.values()].map((p) => {
+    const final = p.final;
+    const inicio = redondear(final - p.netoMov, 3);
+    const costoU = p.costoUnit > 0 ? p.costoUnit : 0;
+    return {
+      id: p.id,
+      codigo: p.codigo,
+      nombre: p.nombre,
+      familia: p.familia,
+      inicio,
+      entradas: redondear(p.entradas, 3),
+      ventas: redondear(p.ventas, 3),
+      devoluciones: redondear(p.devoluciones, 3),
+      mermas: redondear(p.mermas, 3),
+      transferencias: redondear(p.transferencias, 3),
+      otros: redondear(p.otros, 3),
+      final: redondear(final, 3),
+      importeVentas: redondear(p.importeVentas),
+      valorInicio: redondear(inicio * costoU),
+      valorFinal: redondear(final * costoU),
+      costoUnit: costoU,
+      tipos: Object.values(p.tipos),
+    };
+  });
+
+  // Orden: más movimiento / más ventas primero
+  filasMov.sort((a, b) => b.ventas - a.ventas || Math.abs(b.final) - Math.abs(a.final));
+
+  // Totales
+  const tot = filasMov.reduce(
+    (a, x) => ({
+      inicio: a.inicio + x.inicio,
+      entradas: a.entradas + x.entradas,
+      ventas: a.ventas + x.ventas,
+      devoluciones: a.devoluciones + x.devoluciones,
+      mermas: a.mermas + x.mermas,
+      final: a.final + x.final,
+      importeVentas: a.importeVentas + x.importeVentas,
+      valorInicio: a.valorInicio + x.valorInicio,
+      valorFinal: a.valorFinal + x.valorFinal,
+    }),
+    { inicio: 0, entradas: 0, ventas: 0, devoluciones: 0, mermas: 0, final: 0, importeVentas: 0, valorInicio: 0, valorFinal: 0 }
+  );
+
+  // Stock valorado por local (como antes)
+  const stockLocalParams = [busca, busca, busca];
+  let stockLocalFiltro = " AND COALESCE(g.Deleted,0) = 0";
+  if (tieneLocal) {
+    stockLocalFiltro += " AND s.ObjectID = ?";
+    stockLocalParams.push(local);
+  }
+  const filasStockLocal = await filas(
+    pool,
+    `SELECT s.ObjectID AS lid, o.Name AS local, g.ID AS id, g.Name AS nombre,
+            SUM(s.Qtty) AS cantidad, g.PriceIn AS costoUnit, ${PRECIO} AS precioUnit
+     FROM store s JOIN goods g ON g.ID = s.GoodID JOIN objects o ON o.ID = s.ObjectID
+     WHERE (g.Name LIKE ? OR g.Code LIKE ? OR g.BarCode1 LIKE ?)${stockLocalFiltro}
+     GROUP BY s.ObjectID, o.Name, g.ID, g.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     HAVING SUM(s.Qtty) > 0.0005`,
+    stockLocalParams
+  );
+  const porLocal = {};
+  for (const x of filasStockLocal) {
+    const L = x.local || "Sin local";
+    const cant = num(x.cantidad);
+    const vCosto = cant * (num(x.costoUnit) > 0 ? num(x.costoUnit) : 0);
+    const vVenta = cant * (num(x.precioUnit) > 0 ? num(x.precioUnit) : 0);
+    if (!porLocal[L]) porLocal[L] = { local: L, lid: x.lid, piezas: 0, costo: 0, venta: 0, refs: 0 };
+    porLocal[L].piezas += cant;
+    porLocal[L].costo += vCosto;
+    porLocal[L].venta += vVenta;
+    porLocal[L].refs += 1;
+  }
+
+  const locales = await filas(
+    pool,
+    `SELECT o.ID AS id, o.Name AS nombre FROM objects o
+     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND ABS(s.Qtty) > 0.0005)
+     ORDER BY o.Name`
+  );
+
+  return {
+    desde,
+    hasta,
+    resumen: {
+      productos: filasMov.length,
+      inicio: redondear(tot.inicio, 2),
+      entradas: redondear(tot.entradas, 2),
+      ventas: redondear(tot.ventas, 2),
+      devoluciones: redondear(tot.devoluciones, 2),
+      mermas: redondear(tot.mermas, 2),
+      final: redondear(tot.final, 2),
+      importeVentas: redondear(tot.importeVentas),
+      valorInicio: redondear(tot.valorInicio),
+      valorFinal: redondear(tot.valorFinal),
+    },
+    tiposMovimiento: Object.values(tiposAgg).sort((a, b) => b.volumen - a.volumen),
+    porLocal: Object.values(porLocal)
+      .map((x) => ({ ...x, piezas: redondear(x.piezas, 2), costo: redondear(x.costo), venta: redondear(x.venta) }))
+      .sort((a, b) => b.costo - a.costo),
+    locales: locales.map((x) => ({ id: x.id, nombre: x.nombre })),
+    // Tabla principal: inicio → movimientos → final
+    filas: filasMov.slice(0, 250),
+  };
+}
+
+// ---------- Sugerencias de traspaso almacén → punto de venta ----------
+export async function traspasos(pool, ctx, q) {
+  const aj = ctx.aj;
+  const { desde, hasta } = ctx.r;
+  const dias = Math.max(ctx.r.dias || aj.ventanaVentas || 30, 7);
+  // Días de cobertura objetivo en el punto de venta
+  const diasObjetivo = Math.max(parseInt(q.dias, 10) || aj.cobertura || 14, 3);
+
+  // Locales con ventas en el período (candidatos a punto de venta) vía turnos
+  let ventasPorLocal;
+  try {
+    ventasPorLocal = await filas(
+      pool,
+      `SELECT sh.ObjectID AS lid, obj.Name AS local, COUNT(DISTINCT o.Acct) AS tickets, COALESCE(SUM(${IMP}),0) AS total
+       FROM operations o
+       JOIN shift sh ON sh.ID = o.ShiftID
+       JOIN objects obj ON obj.ID = sh.ObjectID
+       WHERE ${VENTA} AND ${RANGO}
+       GROUP BY sh.ObjectID, obj.Name
+       ORDER BY total DESC`,
+      [desde, hasta]
+    );
+  } catch {
+    ventasPorLocal = await filas(
+      pool,
+      `SELECT o.ID AS lid, o.Name AS local, 0 AS tickets, 0 AS total FROM objects o
+       WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0) ORDER BY o.Name`
+    );
+  }
+
+  const stockPorLocal = await filas(
+    pool,
+    `SELECT s.ObjectID AS lid, o.Name AS local, s.GoodID AS gid, g.Code AS codigo, g.Name AS nombre,
+            COALESCE(gg.Name,'Sin grupo') AS familia, SUM(s.Qtty) AS cant, g.PriceIn AS costo, ${PRECIO} AS precio
+     FROM store s
+     JOIN objects o ON o.ID = s.ObjectID
+     JOIN goods g ON g.ID = s.GoodID
+     LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
+     WHERE COALESCE(g.Deleted,0) = 0
+     GROUP BY s.ObjectID, o.Name, s.GoodID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     HAVING SUM(s.Qtty) > 0.0005`
+  );
+
+  // Ventas por producto (global en el período) para estimar demanda diaria
+  const ventasProd = await filas(
+    pool,
+    `SELECT o.GoodID AS gid, SUM(ABS(o.Qtty)) AS unidades
+     FROM operations o WHERE ${VENTA} AND ${RANGO}
+     GROUP BY o.GoodID`,
+    [desde, hasta]
+  );
+  const demanda = new Map(ventasProd.map((x) => [num(x.gid), num(x.unidades) / dias]));
+
+  // Clasificar locales: con ventas = PV; sin ventas pero con stock = almacén
+  const lidsConVenta = new Set(ventasPorLocal.filter((x) => num(x.tickets) > 0 || num(x.total) > 0).map((x) => num(x.lid)));
+  const todosLids = [...new Set(stockPorLocal.map((x) => num(x.lid)))];
+  const pvLids = lidsConVenta.size ? lidsConVenta : new Set(todosLids.slice(0, 1));
+  const almLids = new Set(todosLids.filter((id) => !pvLids.has(id)));
+  // Si no hay almacén distinto, usar el local con más stock y menos ventas como "almacén"
+  if (almLids.size === 0 && todosLids.length > 1) {
+    const ranking = todosLids.map((id) => {
+      const st = stockPorLocal.filter((s) => num(s.lid) === id).reduce((a, s) => a + num(s.cant), 0);
+      const vt = ventasPorLocal.find((v) => num(v.lid) === id);
+      return { id, st, tickets: num(vt?.tickets) };
+    }).sort((a, b) => a.tickets - b.tickets || b.st - a.st);
+    if (ranking[0]) almLids.add(ranking[0].id);
+  }
+
+  // Stock index: gid -> { pv: cant, alm: cant, nombre, ... }
+  const idx = new Map();
+  for (const s of stockPorLocal) {
+    const gid = num(s.gid);
+    if (!idx.has(gid)) {
+      idx.set(gid, {
+        id: gid,
+        codigo: s.codigo,
+        nombre: s.nombre,
+        familia: s.familia,
+        costo: num(s.costo),
+        precio: num(s.precio),
+        enPv: 0,
+        enAlm: 0,
+        detallePv: [],
+        detalleAlm: [],
+      });
+    }
+    const row = idx.get(gid);
+    const cant = num(s.cant);
+    const lid = num(s.lid);
+    if (pvLids.has(lid)) {
+      row.enPv += cant;
+      row.detallePv.push({ local: s.local, cant });
+    }
+    if (almLids.has(lid)) {
+      row.enAlm += cant;
+      row.detalleAlm.push({ local: s.local, cant });
+    }
+  }
+
+  const sugerencias = [];
+  for (const row of idx.values()) {
+    const diaria = demanda.get(row.id) || 0;
+    if (diaria <= 0 && row.enPv > 0) continue; // no se vende y ya hay en PV
+    if (row.enAlm <= 0.0005) continue; // nada en almacén
+    const coberturaPv = diaria > 0 ? row.enPv / diaria : (row.enPv > 0 ? 999 : 0);
+    // Hace falta si cobertura en PV < días objetivo, o está agotado en PV y se vende
+    if (diaria > 0 && coberturaPv >= diasObjetivo) continue;
+    if (diaria <= 0) continue;
+    const objetivo = diaria * diasObjetivo;
+    let pedir = Math.max(0, objetivo - row.enPv);
+    pedir = Math.min(pedir, row.enAlm);
+    pedir = redondear(pedir, 2);
+    if (pedir < 0.5 && row.enPv > 0.0005) continue;
+    if (pedir < 0.01) continue;
+    const urgencia = coberturaPv <= 3 ? "alta" : coberturaPv <= 7 ? "media" : "baja";
+    sugerencias.push({
+      id: row.id,
+      codigo: row.codigo,
+      nombre: row.nombre,
+      familia: row.familia,
+      diaria: redondear(diaria, 2),
+      enPv: redondear(row.enPv, 2),
+      enAlm: redondear(row.enAlm, 2),
+      coberturaPv: redondear(coberturaPv, 1),
+      sugerido: pedir,
+      valorCosto: redondear(pedir * (row.costo > 0 ? row.costo : 0)),
+      urgencia,
+      desde: row.detalleAlm.map((d) => `${d.local}: ${redondear(d.cant, 1)}`).join(", "),
+      hacia: row.detallePv.map((d) => `${d.local}: ${redondear(d.cant, 1)}`).join(", ") || "Punto de venta",
+    });
+  }
+  sugerencias.sort((a, b) => {
+    const u = { alta: 0, media: 1, baja: 2 };
+    return (u[a.urgencia] - u[b.urgencia]) || b.sugerido - a.sugerido;
+  });
+
+  const localesPv = [...pvLids].map((id) => {
+    const v = ventasPorLocal.find((x) => num(x.lid) === id);
+    const n = stockPorLocal.find((x) => num(x.lid) === id);
+    return { id, nombre: v?.local || n?.local || String(id), tickets: num(v?.tickets) };
+  });
+  const localesAlm = [...almLids].map((id) => {
+    const n = stockPorLocal.find((x) => num(x.lid) === id);
+    return { id, nombre: n?.local || String(id) };
+  });
+
+  return {
+    dias,
+    diasObjetivo,
+    puntosVenta: localesPv,
+    almacenes: localesAlm,
+    resumen: {
+      productos: sugerencias.length,
+      unidades: redondear(sugerencias.reduce((s, x) => s + x.sugerido, 0), 1),
+      valorCosto: redondear(sugerencias.reduce((s, x) => s + x.valorCosto, 0)),
+      altas: sugerencias.filter((x) => x.urgencia === "alta").length,
+    },
+    filas: sugerencias.slice(0, 120),
   };
 }
 

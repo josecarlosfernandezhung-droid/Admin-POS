@@ -376,7 +376,7 @@ async function manejar(req, res) {
     }
     if (ruta === "/api/licencia/activar" && req.method === "POST") {
       const b = await leerJson(req);
-      const token = String(b.token || b.licencia || "").trim();
+      const token = Lic.normalizarToken(b.token || b.licencia || "");
       if (!token) return falla(res, 400, "Pega la licencia.");
       const v = Lic.verificarToken(token);
       if (!v.ok) return falla(res, 400, v.error || "Licencia no válida");

@@ -15,7 +15,8 @@ const PRODUCTO = "ADMINPOS";
  * Cuando la rellenes, el programa EXIGE licencia aunque borren clave_publica.txt.
  * Ejemplo: pega aquí la misma línea que muestra el generador en "Clave pública".
  */
-const CLAVE_PUBLICA_EMBEBIDA = "";
+const CLAVE_PUBLICA_EMBEBIDA =
+  "BCXbleMq3+rvSGa5SxMU/rvv6fe9PrJe8uIxUoMoZrSRY/1KszcWqM63VlI/V8mfxDwt45VPWZFu1BWM2aS+h0s=";
 
 let dirDatos = join(DIR, "..", "data");
 let pubKey = null;
@@ -78,7 +79,20 @@ function importarPublica(raw) {
   if (!raw) return null;
   const t = String(raw).trim();
   if (!t || t.startsWith("#")) return null;
-  // Puede venir con comentarios: tomar primera línea no vacía sin #
+
+  // JWK completo pegado (a veces exportan JSON)
+  if (t.startsWith("{") && t.includes("kty")) {
+    try {
+      const j = JSON.parse(t);
+      if (j.kty === "EC" && j.x && j.y) {
+        return createPublicKey({
+          key: { kty: "EC", crv: j.crv || "P-256", x: j.x, y: j.y },
+          format: "jwk",
+        });
+      }
+    } catch {}
+  }
+
   const linea = t.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
   if (!linea) return null;
 
@@ -96,7 +110,15 @@ function importarPublica(raw) {
       format: "jwk",
     });
   }
-  // SPKI DER
+  // Algunos generadores guardan solo X||Y (64 bytes)
+  if (buf.length === 64) {
+    const x = buf.subarray(0, 32).toString("base64url");
+    const y = buf.subarray(32, 64).toString("base64url");
+    return createPublicKey({
+      key: { kty: "EC", crv: "P-256", x, y },
+      format: "jwk",
+    });
+  }
   try {
     return createPublicKey({ key: buf, format: "der", type: "spki" });
   } catch {
@@ -104,11 +126,17 @@ function importarPublica(raw) {
   }
 }
 
+/** Quita saltos de línea/espacios que mete WhatsApp o el móvil al pegar. */
+export function normalizarToken(token) {
+  return String(token || "").replace(/\s+/g, "").trim();
+}
+
 function cargarClavePublica(rawB64) {
   const candidatos = [];
+  // Embebida primero: garantiza la misma llave en .exe instalado
+  if (CLAVE_PUBLICA_EMBEBIDA) candidatos.push(CLAVE_PUBLICA_EMBEBIDA);
   if (rawB64) candidatos.push(rawB64);
   if (process.env.ADMINPOS_PUBKEY) candidatos.push(process.env.ADMINPOS_PUBKEY);
-  if (CLAVE_PUBLICA_EMBEBIDA) candidatos.push(CLAVE_PUBLICA_EMBEBIDA);
 
   const archivos = [
     join(DIR, "clave_publica.txt"),
@@ -214,7 +242,8 @@ function antiRollback(expYmd) {
 
 /** Verifica token. Devuelve { ok, ... } */
 export function verificarToken(token, mcEsperado = codigoPC()) {
-  if (!token || typeof token !== "string") return { ok: false, error: "Sin licencia" };
+  token = normalizarToken(token);
+  if (!token) return { ok: false, error: "Sin licencia" };
   if (!pubKey) {
     return {
       ok: false,
@@ -224,38 +253,41 @@ export function verificarToken(token, mcEsperado = codigoPC()) {
     };
   }
 
-  const partes = token.trim().split(".");
-  if (partes.length !== 2) return { ok: false, error: "Formato de licencia inválido" };
+  const partes = token.split(".");
+  if (partes.length !== 2) {
+    return {
+      ok: false,
+      error: partes.length < 2
+        ? "Licencia incompleta (debe tener dos partes separadas por un punto)"
+        : "Formato de licencia inválido",
+    };
+  }
 
   let payloadBuf, sigBuf;
   try {
     payloadBuf = ub64(partes[0]);
     sigBuf = ub64(partes[1]);
   } catch {
-    return { ok: false, error: "Licencia corrupta" };
+    return { ok: false, error: "Licencia corrupta o mal copiada" };
   }
 
-  // WebCrypto firma en formato IEEE P1363 (r||s); Node debe usar dsaEncoding
+  // WebCrypto firma en IEEE P1363 (r||s); también probamos DER
   let okSig = false;
-  try {
-    okSig = verify(
-      "SHA-256",
-      payloadBuf,
-      { key: pubKey, dsaEncoding: "ieee-p1363" },
-      sigBuf
-    );
-  } catch {
-    okSig = false;
+  for (const enc of ["ieee-p1363", "der"]) {
+    try {
+      if (verify("SHA-256", payloadBuf, { key: pubKey, dsaEncoding: enc }, sigBuf)) {
+        okSig = true;
+        break;
+      }
+    } catch {}
   }
   if (!okSig) {
-    // Reintento por si alguien firmó en DER
-    try {
-      okSig = verify("SHA-256", payloadBuf, { key: pubKey, dsaEncoding: "der" }, sigBuf);
-    } catch {
-      okSig = false;
-    }
+    return {
+      ok: false,
+      error:
+        "Firma no válida. Casi siempre: (1) la clave pública de esta app no es la del generador que firmó, o (2) la licencia se pegó cortada. Copia de nuevo la clave pública del generador a server/clave_publica.txt y vuelve a generar la licencia con el código de esta PC.",
+    };
   }
-  if (!okSig) return { ok: false, error: "Firma no válida" };
 
   const txt = payloadBuf.toString("utf8");
   const datos = parsePayload(txt);

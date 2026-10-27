@@ -8,7 +8,15 @@ const VENTA = "o.OperType = 2 AND COALESCE(o.Sign, 0) <= 0";
 const DEVOL = "o.OperType = 34";
 const RANGO = `${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY)`;
 const PRECIO = "COALESCE(NULLIF(g.PriceOut2,0), NULLIF(g.PriceOut1,0), NULLIF(g.PriceOut3,0), 0)";
-const STOCK = "(SELECT GoodID, SUM(Qtty) AS cant FROM store GROUP BY GoodID)";
+// Almacenes que el administrador decidió no mostrar (Ajustes → Almacenes visibles)
+let OCULTOS = [];
+export function fijarAlmacenesOcultos(lista) {
+  OCULTOS = (Array.isArray(lista) ? lista : []).map(Number).filter((n) => Number.isInteger(n));
+}
+const noOculto = (col) => (OCULTOS.length ? ` AND ${col} NOT IN (${OCULTOS.join(",")})` : "");
+const whereStore = () => (OCULTOS.length ? ` WHERE ObjectID NOT IN (${OCULTOS.join(",")})` : "");
+// Se evalúa al armar cada consulta, así siempre respeta los almacenes ocultos actuales
+const STOCK = { toString: () => `(SELECT GoodID, SUM(Qtty) AS cant FROM store${whereStore()} GROUP BY GoodID)` };
 
 const ymd = (d) => d.toISOString().slice(0, 10);
 export const sumarDias = (s, n) => {
@@ -561,21 +569,21 @@ export async function existencias(pool, ctx, q) {
   const pagina = Math.max(parseInt(q.pagina, 10) || 1, 1);
   const local = parseInt(q.local, 10);
   const params = [busca, busca];
-  let filtro = "";
+  let filtro = noOculto("s.ObjectID");
   if (Number.isInteger(local)) {
-    filtro = " AND s.ObjectID = ?";
+    filtro += " AND s.ObjectID = ?";
     params.push(local);
   }
   const base = `SELECT s.ObjectID AS lid, o.Name AS local, s.GoodID AS id, g.Name AS nombre, SUM(s.Qtty) AS cantidad
     FROM store s JOIN goods g ON g.ID = s.GoodID JOIN objects o ON o.ID = s.ObjectID
     WHERE (g.Name LIKE ? OR g.Code LIKE ?)${filtro} GROUP BY s.ObjectID, o.Name, s.GoodID, g.Name HAVING SUM(s.Qtty) > 0.0005`;
   const [kpi, agot, locales, [cuenta], lista] = await Promise.all([
-    una(pool, `SELECT COUNT(*) AS referencias, COALESCE(SUM(t.cant),0) AS piezas FROM (SELECT GoodID, SUM(Qtty) AS cant FROM store GROUP BY GoodID HAVING SUM(Qtty) > 0.0005) t`),
+    una(pool, `SELECT COUNT(*) AS referencias, COALESCE(SUM(t.cant),0) AS piezas FROM (SELECT GoodID, SUM(Qtty) AS cant FROM store${whereStore()} GROUP BY GoodID HAVING SUM(Qtty) > 0.0005) t`),
     filas(pool, `SELECT g.Name AS nombre, v.total AS importe
       FROM (SELECT o.GoodID, SUM(${IMP}) AS total FROM operations o WHERE ${VENTA} AND ${RANGO} GROUP BY o.GoodID) v
       JOIN goods g ON g.ID = v.GoodID LEFT JOIN ${STOCK} s ON s.GoodID = v.GoodID
       WHERE COALESCE(s.cant,0) <= 0.0005 ORDER BY v.total DESC`, [desde, hasta]),
-    filas(pool, `SELECT o.ID AS id, o.Name AS nombre, o.Deleted AS archivado FROM objects o WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty <> 0) ORDER BY o.Name`),
+    filas(pool, `SELECT o.ID AS id, o.Name AS nombre, o.Deleted AS archivado FROM objects o WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty <> 0)${noOculto("o.ID")} ORDER BY o.Name`),
     pool.query(`SELECT COUNT(*) AS n FROM (${base}) z`, params),
     filas(pool, `${base} ORDER BY cantidad DESC, nombre LIMIT 40 OFFSET ${(pagina - 1) * 40}`, params),
   ]);
@@ -615,7 +623,7 @@ export async function ipv(pool, ctx, q) {
 
   // --- Stock actual (existencia final) por producto ---
   const stockParams = [busca, busca, busca];
-  let stockFiltro = " AND COALESCE(g.Deleted,0) = 0";
+  let stockFiltro = " AND COALESCE(g.Deleted,0) = 0" + noOculto("s.ObjectID");
   if (tieneLocal) {
     stockFiltro += " AND s.ObjectID = ?";
     stockParams.push(local);
@@ -680,7 +688,7 @@ export async function ipv(pool, ctx, q) {
         mermas: 0,
         transferencias: 0,
         otros: 0,
-        netoMov: 0, // suma de Qtty firmada en el período
+        netoMov: 0, // efecto real en existencia (según tipo de operación, no según el signo guardado)
         importeVentas: 0,
         tipos: {},
       });
@@ -701,7 +709,12 @@ export async function ipv(pool, ctx, q) {
     }
     const vol = num(m.volumen);
     const neto = num(m.neto);
-    row.netoMov += neto;
+    // AxisPOS no guarda siempre el mismo signo (las ventas pueden venir en positivo).
+    // El efecto sobre la existencia se decide por el TIPO de operación.
+    const SUMAN = [1, 12, 27, 34]; // entrada, recepción, traspaso entrante, devolución de venta
+    const RESTAN = [2, 3, 11, 26, 35]; // venta, merma, baja, traspaso saliente, devolución a proveedor
+    const efecto = SUMAN.includes(tipo) ? vol : RESTAN.includes(tipo) ? -vol : neto;
+    row.netoMov += efecto;
     row.tipos[tipo] = { tipo, nombre: NOMBRE_OPER[tipo] || `Tipo ${tipo}`, volumen: vol, neto, importe: num(m.importe), n: num(m.n) };
 
     if (!tiposAgg[tipo]) tiposAgg[tipo] = { tipo, nombre: NOMBRE_OPER[tipo] || `Tipo ${tipo}`, volumen: 0, importe: 0, n: 0 };
@@ -714,7 +727,7 @@ export async function ipv(pool, ctx, q) {
       row.importeVentas += num(m.importe);
     } else if (tipo === 34) {
       row.devoluciones += vol;
-    } else if (tipo === 1 || tipo === 12 || tipo === 27 || tipo === 35) {
+    } else if (tipo === 1 || tipo === 12 || tipo === 27) {
       row.entradas += vol;
     } else if (tipo === 3 || tipo === 11) {
       row.mermas += vol;
@@ -751,7 +764,9 @@ export async function ipv(pool, ctx, q) {
   const pctCostoIpv = ctx.aj?.costoEstimadoPct ?? 10;
   const filasMov = [...porProd.values()].map((p) => {
     const final = p.final;
-    const inicio = redondear(final - p.netoMov, 3);
+    // La existencia inicial nunca puede ser negativa: si el cálculo da menos de 0,
+    // el registro de entradas está incompleto y se muestra 0.
+    const inicio = Math.max(0, redondear(final - p.netoMov, 3));
     const costoU = costoDe(p.costoUnit, p.precioUnit, pctCostoIpv);
     return {
       id: p.id,
@@ -795,7 +810,7 @@ export async function ipv(pool, ctx, q) {
 
   // Stock valorado por local (como antes)
   const stockLocalParams = [busca, busca, busca];
-  let stockLocalFiltro = " AND COALESCE(g.Deleted,0) = 0";
+  let stockLocalFiltro = " AND COALESCE(g.Deleted,0) = 0" + noOculto("s.ObjectID");
   if (tieneLocal) {
     stockLocalFiltro += " AND s.ObjectID = ?";
     stockLocalParams.push(local);
@@ -826,7 +841,7 @@ export async function ipv(pool, ctx, q) {
   const locales = await filas(
     pool,
     `SELECT o.ID AS id, o.Name AS nombre FROM objects o
-     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND ABS(s.Qtty) > 0.0005)
+     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND ABS(s.Qtty) > 0.0005)${noOculto("o.ID")}
      ORDER BY o.Name`
   );
 
@@ -881,7 +896,7 @@ export async function traspasos(pool, ctx, q) {
     ventasPorLocal = await filas(
       pool,
       `SELECT o.ID AS lid, o.Name AS local, 0 AS tickets, 0 AS total FROM objects o
-       WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0) ORDER BY o.Name`
+       WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0)${noOculto("o.ID")} ORDER BY o.Name`
     );
   }
 
@@ -895,7 +910,7 @@ export async function traspasos(pool, ctx, q) {
      JOIN objects o ON o.ID = s.ObjectID
      JOIN goods g ON g.ID = s.GoodID
      LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-     WHERE COALESCE(g.Deleted,0) = 0
+     WHERE COALESCE(g.Deleted,0) = 0${noOculto("s.ObjectID")}
      GROUP BY s.ObjectID, o.Name, s.GoodID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.MinQtty
      HAVING SUM(s.Qtty) > 0.0005`
   );
@@ -1717,7 +1732,7 @@ export async function antiguedadStock(pool, ctx) {
     `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
             SUM(s.Qtty) AS stock, g.PriceIn AS costo, ${PRECIO} AS precio
      FROM store s JOIN goods g ON g.ID = s.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-     WHERE COALESCE(g.Deleted,0)=0 GROUP BY g.ID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     WHERE COALESCE(g.Deleted,0)=0${noOculto("s.ObjectID")} GROUP BY g.ID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
      HAVING SUM(s.Qtty) > 0.0005`
   );
   const buckets = { d0_30: [], d31_60: [], d61_90: [], d90: [], nunca: [] };
@@ -1823,7 +1838,7 @@ export async function inventarioFisico(pool, ctx, body) {
     pool,
     `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(SUM(s.Qtty),0) AS sistema,
             g.PriceIn AS costo, ${PRECIO} AS precio
-     FROM goods g LEFT JOIN store s ON s.GoodID = g.ID
+     FROM goods g LEFT JOIN store s ON s.GoodID = g.ID${noOculto("s.ObjectID")}
      WHERE COALESCE(g.Deleted,0)=0
      GROUP BY g.ID, g.Code, g.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3`
   );
@@ -2170,7 +2185,7 @@ export async function listaArqueo(pool, ctx, q) {
      FROM store s
      JOIN goods g ON g.ID = s.GoodID
      LEFT JOIN objects o ON o.ID = s.ObjectID
-     WHERE COALESCE(g.Deleted,0)=0 ${lid ? "AND s.ObjectID = ?" : ""}
+     WHERE COALESCE(g.Deleted,0)=0${noOculto("s.ObjectID")} ${lid ? "AND s.ObjectID = ?" : ""}
      GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.MinQtty, o.Name, s.ObjectID
      HAVING ABS(COALESCE(SUM(s.Qtty),0)) > 0.0005 OR 1=1
      ORDER BY g.Name
@@ -2337,4 +2352,19 @@ export async function busquedaGlobal(pool, ctx, q) {
     productos: productos.map((x) => ({ id: x.id, codigo: x.codigo, nombre: x.nombre, precio: num(x.precio) })),
     usuarios: usuarios.map((x) => ({ id: x.id, nombre: x.nombre })),
   };
+}
+
+
+/** Todos los almacenes con existencias registradas (para el selector de Ajustes). */
+export async function almacenesTodos(pool) {
+  const f = await filas(
+    pool,
+    `SELECT o.ID AS id, o.Name AS nombre, o.Deleted AS archivado,
+            (SELECT COUNT(DISTINCT s.GoodID) FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0.0005) AS productos,
+            (SELECT COALESCE(SUM(s.Qtty),0) FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0.0005) AS piezas
+     FROM objects o
+     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty <> 0)
+     ORDER BY o.Name`
+  );
+  return f.map((x) => ({ id: num(x.id), nombre: x.nombre + (num(x.archivado) !== 0 ? " (archivado)" : ""), productos: num(x.productos), piezas: redondear(x.piezas, 1) }));
 }

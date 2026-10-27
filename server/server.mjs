@@ -239,6 +239,7 @@ async function verAjustes(res, p) {
   responder(res, 200, {
     db: { host: db.host, puerto: db.puerto, base: db.base, usuario: db.usuario, permisos: await Q.comprobarPermisos(p) },
     ajustes: cfg.ajustes,
+    almacenes: await Q.almacenesTodos(p).catch(() => []),
     usuarios: lista.map((u) => ({ id: u.id, nombre: u.nombre, grupo: u.grupo, nivel: u.nivel, rolDefecto: A.rolPorNivel(u.nivel), rol: A.rolDe(u.id, u.nivel), tienePin: !!cfg.usuarios[u.id]?.hash })),
   });
 }
@@ -265,6 +266,11 @@ async function ajustesPost(req, res, ruta, s, p) {
     if (era === "admin" && b.rol !== "admin" && cfg.usuarios[u.id]?.hash && adminsConPin(lista).length <= 1) return falla(res, 400, "Debe quedar al menos un administrador con PIN.");
     cfg.usuarios[u.id] = { ...(cfg.usuarios[u.id] || {}), rol: b.rol };
     A.cerrarSesionesDe(u.id);
+  } else if (ruta === "/api/ajustes/almacenes") {
+    const ids = Array.isArray(b.ocultos) ? b.ocultos.map(Number).filter((n) => Number.isInteger(n)) : null;
+    if (!ids) return falla(res, 400, "Datos no válidos.");
+    cfg.ajustes.almacenesOcultos = [...new Set(ids)];
+    Q.fijarAlmacenesOcultos(cfg.ajustes.almacenesOcultos);
   } else if (ruta === "/api/ajustes/params") {
     const lim = { tasa: [1, 100000], plazoRepos: [0, 120], seguridad: [0, 60], cobertura: [1, 365], ventanaVentas: [7, 365], umbralCancel: [1, 1e9], descMax: [1, 100], tolCierre: [0, 1e7], costoEstimadoPct: [0, 90] };
     for (const [k, [mn, mx]] of Object.entries(lim)) {
@@ -293,6 +299,7 @@ const MODULO = {
 async function consulta(res, nombre, s, p, q) {
   if (!A.PERMISOS[s.rol].includes(MODULO[nombre] || "conteos") && nombre !== "conteos") return falla(res, 403, "Tu rol no tiene acceso a esta sección.");
   const aj = A.leer().ajustes;
+  Q.fijarAlmacenesOcultos(aj.almacenesOcultos);
   const r = await Q.resolverRango(p, q.periodo, q);
   const ctx = { r, uid: s.rol === "cajero" ? s.id : null, rol: s.rol, aj, rolDe: A.rolDe };
   let datos;
@@ -437,6 +444,7 @@ async function manejar(req, res) {
       if (!A.PERMISOS[s.rol].includes("inventario")) return falla(res, 403, "Sin permiso de inventario.");
       const body = await leerJson(req);
       const aj = A.leer().ajustes;
+      Q.fijarAlmacenesOcultos(aj.almacenesOcultos);
       const r = await Q.resolverRango(p, "30", {});
       const ctx = { r, uid: null, rol: s.rol, aj, rolDe: A.rolDe };
       const modo = (url.searchParams.get("modo") || "") === "ajustes";
@@ -457,6 +465,7 @@ export function iniciar(puerto = 3000, opciones = {}) {
   if (opciones && (opciones.dir || opciones.cifrar || opciones.descifrar)) {
     A.configurarAlmacen(opciones);
   }
+  try { Q.fijarAlmacenesOcultos(A.leer().ajustes.almacenesOcultos); } catch {}
   Lic.configurarLicencia({
     dir: opciones?.dir,
     empaquetado: opciones?.empaquetado,

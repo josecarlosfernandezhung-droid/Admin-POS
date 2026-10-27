@@ -28,9 +28,13 @@ jobs:
           cp -r resources/android/. android/app/src/main/res/
       - name: Permitir conexión por WiFi local (http) y giro de pantalla
         run: |
-          sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
-          sed -i 's/<activity/<activity android:screenOrientation="fullUser"/' android/app/src/main/AndroidManifest.xml
-          grep -n "screenOrientation" android/app/src/main/AndroidManifest.xml
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:usesCleartextTraffic="true"/' $M
+          sed -i 's/android:screenOrientation="[a-zA-Z]*"//g' $M
+          sed -i 's/<activity/<activity android:screenOrientation="fullUser"/' $M
+          echo "---- Manifest resultante ----"
+          grep -n "screenOrientation\|usesCleartextTraffic" $M
+          grep -q 'screenOrientation="fullUser"' $M || (echo "ERROR: no se aplicó el giro de pantalla" && exit 1)
       - name: Sincronizar
         run: npx cap sync android
       - name: Compilar APK

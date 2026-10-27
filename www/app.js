@@ -305,7 +305,6 @@ function pantallaLicencia(lic = {}) {
         <b>Pega la licencia recibida</b>
         <p class="muted" style="margin:4px 0 8px;font-size:.84rem">Es un texto largo. Cópialo completo, sin espacios de más al inicio o al final.</p>
         <textarea id="tokLic" class="lic-token" rows="5" placeholder="Pega aquí la licencia…" spellcheck="false" autocomplete="off"></textarea>
->
         <p class="error" id="errLic" hidden></p>
         <p class="ok" id="okLic" hidden></p>
       </div>

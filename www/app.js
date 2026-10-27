@@ -337,6 +337,8 @@ function entrarApp() {
     <div class="principal"><div class="barra">
       <div class="marca"><img src="logo.png" alt=""><h2>Admin POS</h2><button class="yo" data-act="menuYo">${e(S.yo.nombre)}</button></div>
       <div class="periodo" id="periodo">${[["hoy", "Hoy"], ["7", "7 días"], ["30", "30 días"], ["90", "90 días"], ["todo", "Todo"], ["custom", "Fechas"]].map(([v, n]) => `<button data-act="periodo" data-v="${v}">${n}</button>`).join("")}
+      </div>
+      <div class="herramientas">
         <button class="btn sec chico" data-act="buscarGlobal" title="Buscar">🔍</button>
         <button class="btn sec chico" data-act="toggleTema" id="btnTema" title="Cambiar tema claro/oscuro">${LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro"}</button>
         <button class="btn sec chico" data-act="prefsUI" title="Preferencias">Aa</button>
@@ -360,7 +362,7 @@ function marcarNav() {
   document.querySelectorAll("[data-act=ir]").forEach((b) => b.classList.toggle("sel", b.dataset.v === S.vista));
   document.querySelectorAll("[data-act=periodo]").forEach((b) => b.classList.toggle("sel", b.dataset.v === S.periodo));
   const p = $("#periodo"); if (p) p.hidden = SIN_PERIODO.includes(S.vista);
-  const rc = $("#rango-custom"); if (rc) rc.hidden = S.periodo !== "custom";
+  const rc = $("#rango-custom"); if (rc) rc.hidden = S.periodo !== "custom" || SIN_PERIODO.includes(S.vista);
   const mb = document.querySelector("#menu .sel"); if (mb) mb.scrollIntoView({ inline: "center", block: "nearest" });
 }
 

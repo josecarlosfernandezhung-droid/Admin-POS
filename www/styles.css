@@ -11,6 +11,7 @@
 }
 * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
 html, body { margin:0; min-height:100%; }
+body { overflow-x:hidden; }
 body { font:15px/1.45 var(--sans); background:var(--fondo); color:var(--texto); }
 [hidden] { display:none !important; }
 h1, h2, h3 { font-family:var(--serif); font-weight:600; margin:0; letter-spacing:-.01em; }
@@ -64,7 +65,8 @@ details.avanzado summary { color:var(--muted); font-size:.88rem; cursor:pointer;
 .marca h2 { font-size:1.45rem; flex:1; }
 .marca .yo { background:var(--acento-suave); border:1px solid var(--borde); padding:8px 12px; border-radius:12px; font-size:.86rem; color:var(--texto); }
 .periodo { display:flex; background:var(--tarjeta); border:1px solid var(--borde); border-radius:999px; padding:5px; margin-bottom:10px; }
-.periodo button { flex:1; background:none; padding:9px 4px; border-radius:999px; color:var(--muted); }
+.periodo button { flex:1; background:none; padding:9px 2px; border-radius:999px; color:var(--muted); white-space:nowrap; font-size:.88rem; }
+.herramientas { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
 .periodo button.sel { background:var(--acento); color:#fff; font-weight:600; }
 .menu { display:flex; gap:8px; overflow-x:auto; padding-bottom:12px; scrollbar-width:none; }
 .menu::-webkit-scrollbar { display:none; }

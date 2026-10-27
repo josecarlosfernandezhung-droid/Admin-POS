@@ -26,8 +26,11 @@ jobs:
         run: |
           find android/app/src/main/res -name 'ic_launcher*.webp' -delete
           cp -r resources/android/. android/app/src/main/res/
-      - name: Permitir conexión por WiFi local (http)
-        run: sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
+      - name: Permitir conexión por WiFi local (http) y giro de pantalla
+        run: |
+          sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's/<activity/<activity android:screenOrientation="fullUser"/' android/app/src/main/AndroidManifest.xml
+          grep -n "screenOrientation" android/app/src/main/AndroidManifest.xml
       - name: Sincronizar
         run: npx cap sync android
       - name: Compilar APK

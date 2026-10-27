@@ -39,7 +39,7 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
 
   windows:
-    name: Programa para Windows (instalable + portable)
+    name: Instalador para Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,15 +48,12 @@ jobs:
           node-version: 22
       - name: Instalar dependencias
         run: npm install --no-audit --no-fund
-      - name: Compilar instalador NSIS y portable
-        run: npx electron-builder --win nsis portable --publish never
+      - name: Compilar instalador NSIS
+        run: npx electron-builder --win nsis --publish never
       - name: Listar salidas
         run: dir dist
       - uses: actions/upload-artifact@v4
         with:
           name: Admin-POS-windows
-          path: |
-            dist/Admin-POS-Setup-*.exe
-            dist/Admin-POS-Portable-*.exe
+          path: dist/Admin-POS-Setup-*.exe
           if-no-files-found: error
-          

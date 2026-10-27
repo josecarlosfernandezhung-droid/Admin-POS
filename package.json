@@ -5,10 +5,15 @@
   "main": "electron/main.cjs",
   "type": "module",
   "private": true,
+  "author": "Toto Tools",
   "scripts": {
     "servidor": "node server/start.mjs",
     "pc": "electron .",
-    "pc:exe": "electron-builder --win portable --publish never"
+    "pc:portable": "electron-builder --win portable --publish never",
+    "pc:instalable": "electron-builder --win nsis --publish never",
+    "pc:ambos": "electron-builder --win portable nsis --publish never",
+    "android:sync": "npx cap sync android",
+    "android:open": "npx cap open android"
   },
   "dependencies": {
     "mysql2": "^3.11.3"
@@ -23,6 +28,10 @@
   "build": {
     "appId": "com.tototools.adminpos",
     "productName": "Admin POS",
+    "copyright": "Copyright © Toto Tools",
+    "directories": {
+      "output": "dist"
+    },
     "files": [
       "electron/**",
       "server/**",
@@ -31,9 +40,34 @@
       "package.json"
     ],
     "win": {
-      "target": "portable",
       "icon": "build/icon.ico",
-      "artifactName": "Admin-POS.exe"
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Admin POS",
+      "uninstallDisplayName": "Admin POS",
+      "artifactName": "Admin-POS-Setup-${version}.exe",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": ["es_ES", "en_US"],
+      "language": "3082"
+    },
+    "portable": {
+      "artifactName": "Admin-POS-Portable-${version}.exe"
     }
   }
 }

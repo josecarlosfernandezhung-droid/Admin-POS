@@ -42,10 +42,23 @@ Esta versión combina **todas** las características de las dos aplicaciones ant
 - **Cajero:** solo sus propias ventas, turnos y tickets; consulta precios y existencias (sin costos).
 El rol sugerido sale del nivel del usuario en AxisPOS (3 = administrador, 2 = gerente, otro = cajero) y se puede cambiar.
 
+## Compilar en la PC (Windows instalable + portable)
+```bash
+npm install
+npm run pc:ambos
+```
+Quedan en la carpeta `dist/`:
+- **Admin-POS-Setup-1.0.0.exe** — instalador (acceso directo, menú Inicio, desinstalar)
+- **Admin-POS-Portable-1.0.0.exe** — no instala; se puede llevar en USB
+
+Solo instalador: `npm run pc:instalable`  
+Solo portable: `npm run pc:portable`
+
 ## Compilar en GitHub
 1. Sube todos los archivos al repositorio (debe existir `.github/workflows/build.yml`).
 2. **Actions → Compilar Admin POS → Run workflow**.
-3. Descarga en *Artifacts*: `Admin-POS-android` (APK) y `Admin-POS-windows` (Admin-POS.exe).
+3. Descarga en *Artifacts*: APK Android y los `.exe` de Windows (instalable y/o portable).
+
 
 ## Notas
 - Si Windows pregunta por el Firewall, permite el acceso en redes privadas.

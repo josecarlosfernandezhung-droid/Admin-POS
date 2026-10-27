@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import * as A from "./almacen.mjs";
 import * as Q from "./consultas.mjs";
+import * as Lic from "./licencia.mjs";
 
 const WWW = join(dirname(fileURLToPath(import.meta.url)), "..", "www");
 const TIPOS = {
@@ -115,7 +116,22 @@ const adminsConPin = (lista) => lista.filter((u) => A.rolDe(u.id, u.nivel) === "
 async function estado(req, res) {
   const cfg = A.leer();
   const local = esLocal(req);
-  const base = { dbConfigurada: !!cfg.db, pinsConfigurados: A.hayPins(), local, ips: ipsLocales() };
+  const lic = Lic.estadoLicencia();
+  const base = {
+    dbConfigurada: !!cfg.db,
+    pinsConfigurados: A.hayPins(),
+    local,
+    ips: ipsLocales(),
+    licencia: {
+      ok: !!lic.ok,
+      requiere: !!lic.requiere && !!lic.tieneClavePublica,
+      mc: lic.mcFmt || lic.mc,
+      error: lic.error || null,
+      cliente: lic.cliente || null,
+      expira: lic.expira || null,
+      tieneClavePublica: !!lic.tieneClavePublica,
+    },
+  };
   if (!cfg.db) return responder(res, 200, { ...base, usuarios: [], dbError: null });
   const err = await probarDb();
   if (err) return responder(res, 200, { ...base, usuarios: [], dbError: err });
@@ -250,7 +266,7 @@ async function ajustesPost(req, res, ruta, s, p) {
     cfg.usuarios[u.id] = { ...(cfg.usuarios[u.id] || {}), rol: b.rol };
     A.cerrarSesionesDe(u.id);
   } else if (ruta === "/api/ajustes/params") {
-    const lim = { tasa: [1, 100000], plazoRepos: [0, 120], seguridad: [0, 60], cobertura: [1, 365], ventanaVentas: [7, 365], umbralCancel: [1, 1e9], descMax: [1, 100], tolCierre: [0, 1e7] };
+    const lim = { tasa: [1, 100000], plazoRepos: [0, 120], seguridad: [0, 60], cobertura: [1, 365], ventanaVentas: [7, 365], umbralCancel: [1, 1e9], descMax: [1, 100], tolCierre: [0, 1e7], costoEstimadoPct: [0, 90] };
     for (const [k, [mn, mx]] of Object.entries(lim)) {
       if (b[k] === undefined) continue;
       const v = Number(b[k]);
@@ -265,10 +281,13 @@ async function ajustesPost(req, res, ruta, s, p) {
 // ---------- Consultas con permiso ----------
 const MODULO = {
   resumen: "resumen", ventas: "ventas", ticket: "ventas", "ventas-dia": "ventas",
-  productos: "productos", top: "productos", "prod-tx": "productos",
-  existencias: "existencias", caja: "caja", equipo: "equipo",
+  productos: "productos", top: "productos", "prod-tx": "productos", "cambios-precio": "productos", margen: "productos", "efecto-precios": "productos",
+  existencias: "existencias", caja: "caja", equipo: "equipo", productividad: "equipo", "duracion-turnos": "equipo", ranking: "equipo", "turnos-horario": "equipo",
   alertas: "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", traspasos: "inventario",
+  antiguedad: "inventario", "traspasos-hechos": "inventario", fisico: "inventario", "lista-arqueo": "inventario",
   anomalias: "perdidas", eventos: "perdidas", mermas: "perdidas", auditoria: "perdidas",
+  devoluciones: "perdidas", "patrones-anulacion": "perdidas",
+  "alertas-inicio": "resumen", panel: "resumen", comparar: "resumen", buscar: "resumen",
 };
 
 async function consulta(res, nombre, s, p, q) {
@@ -285,6 +304,7 @@ async function consulta(res, nombre, s, p, q) {
     case "productos": datos = await Q.productos(p, ctx, q); break;
     case "top": datos = await Q.topProductos(p, ctx, q); break;
     case "prod-tx": datos = await Q.transaccionesProducto(p, ctx, q); break;
+    case "cambios-precio": datos = await Q.cambiosPrecio(p, ctx, q); break;
     case "existencias": datos = await Q.existencias(p, ctx, q); break;
     case "caja": datos = await Q.caja(p, ctx, q); break;
     case "equipo": datos = await Q.equipoCompleto(p, ctx); break;
@@ -297,6 +317,21 @@ async function consulta(res, nombre, s, p, q) {
     case "eventos": datos = await Q.eventos(p, ctx, q); break;
     case "mermas": datos = await Q.mermas(p, ctx); break;
     case "auditoria": datos = await Q.auditoria(p, ctx); break;
+    case "devoluciones": datos = await Q.devolucionesDetalle(p, ctx); break;
+    case "antiguedad": datos = await Q.antiguedadStock(p, ctx); break;
+    case "traspasos-hechos": datos = await Q.traspasosHechos(p, ctx); break;
+    case "margen": datos = await Q.margenProductos(p, ctx); break;
+    case "efecto-precios": datos = await Q.efectoPrecios(p, ctx); break;
+    case "productividad": datos = await Q.productividad(p, ctx); break;
+    case "patrones-anulacion": datos = await Q.patronesAnulacion(p, ctx); break;
+    case "duracion-turnos": datos = await Q.duracionTurnos(p, ctx); break;
+    case "alertas-inicio": datos = await Q.alertasInicio(p, ctx); break;
+    case "panel": datos = await Q.panelDueno(p, ctx); break;
+    case "comparar": datos = await Q.compararPeriodos(p, ctx, q); break;
+    case "buscar": datos = await Q.busquedaGlobal(p, ctx, q); break;
+    case "lista-arqueo": datos = await Q.listaArqueo(p, ctx, q); break;
+    case "ranking": datos = await Q.rankingEquipo(p, ctx); break;
+    case "turnos-horario": datos = await Q.turnosHorario(p, ctx); break;
     case "conteos": {
       datos = {};
       if (A.PERMISOS[s.rol].includes("inventario")) Object.assign(datos, await Q.conteoAlertas(p, ctx));
@@ -336,9 +371,52 @@ async function manejar(req, res) {
     if (!ruta.startsWith("/api/")) return await estatico(res, ruta);
     const q = Object.fromEntries(url.searchParams);
     if (ruta === "/api/estado") return await estado(req, res);
+    if (ruta === "/api/licencia") {
+      return responder(res, 200, Lic.estadoLicencia());
+    }
+    if (ruta === "/api/licencia/activar" && req.method === "POST") {
+      const b = await leerJson(req);
+      const token = String(b.token || b.licencia || "").trim();
+      if (!token) return falla(res, 400, "Pega la licencia.");
+      const v = Lic.verificarToken(token);
+      if (!v.ok) return falla(res, 400, v.error || "Licencia no válida");
+      Lic.guardarLicencia(token);
+      try { Lic.invalidarCacheLicencia(); } catch {}
+      return responder(res, 200, { ok: true, cliente: v.cliente, expira: v.expira });
+    }
+    // Bloqueo por licencia: solo estado/activar/diagnóstico sin licencia
+    const licGate = Lic.licenciaPermiteUso();
+    const rutaLibreLic =
+      ruta === "/api/licencia" ||
+      ruta === "/api/licencia/activar" ||
+      ruta === "/api/estado" ||
+      ruta === "/api/diagnostico" ||
+      ruta === "/api/ping";
+    if (!licGate.ok && !rutaLibreLic) {
+      return falla(res, 402, licGate.error || "Licencia requerida o vencida", {
+        licencia: { mc: Lic.codigoFormateado(), requiere: true },
+      });
+    }
     if (ruta === "/api/login" && req.method === "POST") return await login(req, res);
     if (ruta === "/api/pin/inicial" && req.method === "POST") return await pinInicial(req, res);
     if (ruta === "/api/pin/reiniciar" && req.method === "POST") return await reiniciarPins(req, res);
+    // Stock en vivo para Arqueo Stock (sin PIN; solo lectura de existencias en la red local)
+    if (ruta === "/api/almacen/stockvivo" || ruta === "/api/stockvivo" || ruta === "/api/catalogo" || ruta === "/api/almacen/ping" || ruta === "/api/ping") {
+      const pStock = obtenerPool();
+      if (!pStock) return falla(res, 503, "Falta configurar MariaDB en Admin POS.");
+      if (ruta.endsWith("ping")) return responder(res, 200, { ok: true, catalogo: { cargado: true } });
+      const data = await Q.stockVivo(pStock);
+      return responder(res, 200, data);
+    }
+    // Diagnóstico de red (sin PIN) para el móvil al conectar
+    if (ruta === "/api/diagnostico") {
+      const pDiag = obtenerPool();
+      if (!pDiag) return responder(res, 200, { ok: false, error: "MariaDB no configurada en la PC" });
+      const t0 = Date.now();
+      const d = await Q.diagnostico(pDiag);
+      d.latenciaClienteMs = Date.now() - t0;
+      return responder(res, 200, d);
+    }
     const s = A.sesionDe(req);
     if (ruta === "/api/config/db" && req.method === "POST") return await guardarDb(req, res, s);
     if (ruta === "/api/logout" && req.method === "POST") {
@@ -354,6 +432,17 @@ async function manejar(req, res) {
       if (s.rol !== "admin") return falla(res, 403, "Solo el administrador puede entrar en Ajustes.");
       return ruta === "/api/ajustes" ? await verAjustes(res, p) : await ajustesPost(req, res, ruta, s, p);
     }
+    // Importar conteo físico (JSON exportado desde Arqueo Stock)
+    if (ruta === "/api/fisico" && req.method === "POST") {
+      if (!A.PERMISOS[s.rol].includes("inventario")) return falla(res, 403, "Sin permiso de inventario.");
+      const body = await leerJson(req);
+      const aj = A.leer().ajustes;
+      const r = await Q.resolverRango(p, "30", {});
+      const ctx = { r, uid: null, rol: s.rol, aj, rolDe: A.rolDe };
+      const modo = (url.searchParams.get("modo") || "") === "ajustes";
+      const datos = modo ? await Q.ajustesSugeridos(p, ctx, body) : await Q.inventarioFisico(p, ctx, body);
+      return responder(res, 200, datos);
+    }
     const m = /^\/api\/([\w-]+)$/.exec(ruta);
     if (m) return await consulta(res, m[1], s, p, q);
     falla(res, 404, "No encontrado");
@@ -368,6 +457,12 @@ export function iniciar(puerto = 3000, opciones = {}) {
   if (opciones && (opciones.dir || opciones.cifrar || opciones.descifrar)) {
     A.configurarAlmacen(opciones);
   }
+  Lic.configurarLicencia({
+    dir: opciones?.dir,
+    empaquetado: opciones?.empaquetado,
+    estricto: opciones?.estricto,
+    pubRaw: opciones?.pubRaw,
+  });
   return new Promise((ok, mal) => {
     const srv = http.createServer(manejar);
     srv.once("error", mal);

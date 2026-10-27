@@ -29,6 +29,14 @@ export const AJUSTES_BASE = {
   umbralCancel: 100000, // una cancelación de este monto o más se marca
   descMax: 20, // % de descuento manual a partir del cual se marca
   tolCierre: 500, // diferencia de caja tolerada (CUP)
+  // Si un producto no tiene costo: costo ≈ precio de venta × (1 − costoEstimadoPct/100)
+  // Ej. 10 → costo = precio − 10 % (precio 500 → costo 450)
+  costoEstimadoPct: 10,
+  // Turno esperado (horas): fuera de rango se marca en duración de turnos
+  horaAperturaMin: 7,
+  horaAperturaMax: 10,
+  horasTurnoMax: 12,
+  metaDiaria: 0, // CUP; 0 = sin meta
 };
 
 let cache = null;
@@ -136,9 +144,9 @@ export function rolDe(id, nivel) {
 }
 
 export const PERMISOS = {
-  admin: ["resumen", "ventas", "productos", "existencias", "caja", "equipo", "inventario", "perdidas", "ajustes"],
-  gerente: ["resumen", "ventas", "productos", "existencias", "caja", "equipo", "inventario", "perdidas"],
-  cajero: ["resumen", "ventas", "productos", "existencias", "caja"],
+  admin: ["resumen", "ventas", "productos", "existencias", "caja", "equipo", "inventario", "perdidas", "ajustes", "ayuda"],
+  gerente: ["resumen", "ventas", "productos", "existencias", "caja", "equipo", "inventario", "perdidas", "ayuda"],
+  cajero: ["resumen", "ventas", "productos", "existencias", "caja", "ayuda"],
 };
 
 // --- Sesiones con PIN (en memoria) ---

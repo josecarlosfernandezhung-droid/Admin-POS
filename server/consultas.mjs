@@ -19,6 +19,15 @@ export const sumarDias = (s, n) => {
 const difDias = (a, b) => Math.round((new Date(b + "T00:00:00Z") - new Date(a + "T00:00:00Z")) / 864e5);
 const num = (x) => (x == null ? 0 : Number(x));
 const redondear = (x, d = 2) => Math.round(num(x) * 10 ** d) / 10 ** d;
+/** Costo real o estimado: sin PriceIn → precio × (1 − costoEstimadoPct/100). */
+const costoDe = (costo, precio, pct) => {
+  const c = num(costo);
+  if (c > 0) return c;
+  const p = num(precio);
+  if (p <= 0) return 0;
+  const m = Math.min(Math.max(num(pct) || 0, 0), 99);
+  return p * (1 - m / 100);
+};
 export const numTicket = (acct) => String(Math.trunc(num(acct))).padStart(10, "0");
 
 const filas = async (pool, sql, params = []) => (await pool.query(sql, params))[0];
@@ -58,7 +67,7 @@ export async function resolverRango(pool, periodo, q = {}) {
     return r;
   }
   const hasta = ext.hasta;
-  let dias = periodo === "7" ? 7 : periodo === "90" ? 90 : periodo === "todo" ? null : 30;
+  let dias = periodo === "hoy" || periodo === "1" ? 1 : periodo === "7" ? 7 : periodo === "90" ? 90 : periodo === "todo" ? null : 30;
   let desde;
   if (dias) desde = sumarDias(hasta, -(dias - 1));
   else {
@@ -340,6 +349,97 @@ export async function topProductos(pool, ctx, q) {
       parte: totalImporte > 0 ? num(x.total) / totalImporte : 0,
     })),
     totalImporte,
+  };
+}
+
+/** Productos vendidos a más de un precio en el período y quién los vendió a cada precio. */
+export async function cambiosPrecio(pool, ctx, q) {
+  const { desde, hasta } = ctx.r;
+  const U = uid(ctx);
+  const P = parRango(ctx, desde, hasta);
+  // Precios distintos por producto (PriceOut de la línea de venta)
+  const precios = await filas(
+    pool,
+    `SELECT o.GoodID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
+            o.PriceOut AS precio, SUM(ABS(o.Qtty)) AS unidades, COUNT(DISTINCT o.Acct) AS tickets,
+            SUM(${IMP}) AS total
+     FROM operations o
+     LEFT JOIN goods g ON g.ID = o.GoodID
+     LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
+     WHERE ${VENTA} AND ${RANGO}${U} AND o.PriceOut > 0
+     GROUP BY o.GoodID, g.Code, g.Name, gg.Name, o.PriceOut
+     HAVING o.GoodID IS NOT NULL
+     ORDER BY g.Name, o.PriceOut`,
+    P
+  );
+  // Quién vendió a cada precio
+  const porUsuario = await filas(
+    pool,
+    `SELECT o.GoodID AS id, o.PriceOut AS precio, u.Name AS usuario,
+            SUM(ABS(o.Qtty)) AS unidades, COUNT(DISTINCT o.Acct) AS tickets
+     FROM operations o
+     LEFT JOIN users u ON u.ID = o.UserID
+     WHERE ${VENTA} AND ${RANGO}${U} AND o.PriceOut > 0
+     GROUP BY o.GoodID, o.PriceOut, u.ID, u.Name`,
+    P
+  );
+  const userMap = new Map();
+  for (const x of porUsuario) {
+    const k = `${num(x.id)}|${num(x.precio)}`;
+    if (!userMap.has(k)) userMap.set(k, []);
+    userMap.get(k).push({
+      usuario: x.usuario || "Sin nombre",
+      unidades: num(x.unidades),
+      tickets: num(x.tickets),
+    });
+  }
+  // Agrupar por producto; solo los que tienen ≥ 2 precios distintos
+  const byProd = new Map();
+  for (const x of precios) {
+    const id = num(x.id);
+    if (!byProd.has(id)) {
+      byProd.set(id, {
+        id,
+        codigo: x.codigo,
+        nombre: x.nombre,
+        familia: x.familia,
+        precios: [],
+        precioMin: Infinity,
+        precioMax: 0,
+        unidades: 0,
+        tickets: 0,
+      });
+    }
+    const p = byProd.get(id);
+    const pr = num(x.precio);
+    p.precios.push({
+      precio: pr,
+      unidades: num(x.unidades),
+      tickets: num(x.tickets),
+      total: num(x.total),
+      quienes: userMap.get(`${id}|${pr}`) || [],
+    });
+    p.precioMin = Math.min(p.precioMin, pr);
+    p.precioMax = Math.max(p.precioMax, pr);
+    p.unidades += num(x.unidades);
+    p.tickets += num(x.tickets);
+  }
+  const filasOut = [...byProd.values()]
+    .filter((p) => p.precios.length >= 2)
+    .map((p) => ({
+      ...p,
+      nPrecios: p.precios.length,
+      variacion: p.precioMax - p.precioMin,
+      variacionPct: p.precioMin > 0 ? (p.precioMax - p.precioMin) / p.precioMin : 0,
+      precios: p.precios.sort((a, b) => a.precio - b.precio),
+    }))
+    .sort((a, b) => b.variacion - a.variacion);
+
+  return {
+    desde,
+    hasta,
+    total: filasOut.length,
+    filas: filasOut.slice(0, 150),
   };
 }
 
@@ -648,10 +748,11 @@ export async function ipv(pool, ctx, q) {
 
   // Existencia inicial = final − neto de movimientos del período
   // (neto = suma de Qtty firmadas; ventas restan, entradas suman)
+  const pctCostoIpv = ctx.aj?.costoEstimadoPct ?? 10;
   const filasMov = [...porProd.values()].map((p) => {
     const final = p.final;
     const inicio = redondear(final - p.netoMov, 3);
-    const costoU = p.costoUnit > 0 ? p.costoUnit : 0;
+    const costoU = costoDe(p.costoUnit, p.precioUnit, pctCostoIpv);
     return {
       id: p.id,
       codigo: p.codigo,
@@ -784,16 +885,18 @@ export async function traspasos(pool, ctx, q) {
     );
   }
 
+  const pctCosto = aj.costoEstimadoPct;
   const stockPorLocal = await filas(
     pool,
     `SELECT s.ObjectID AS lid, o.Name AS local, s.GoodID AS gid, g.Code AS codigo, g.Name AS nombre,
-            COALESCE(gg.Name,'Sin grupo') AS familia, SUM(s.Qtty) AS cant, g.PriceIn AS costo, ${PRECIO} AS precio
+            COALESCE(gg.Name,'Sin grupo') AS familia, SUM(s.Qtty) AS cant, g.PriceIn AS costo, ${PRECIO} AS precio,
+            COALESCE(g.MinQtty, 0) AS minimo
      FROM store s
      JOIN objects o ON o.ID = s.ObjectID
      JOIN goods g ON g.ID = s.GoodID
      LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
      WHERE COALESCE(g.Deleted,0) = 0
-     GROUP BY s.ObjectID, o.Name, s.GoodID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     GROUP BY s.ObjectID, o.Name, s.GoodID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.MinQtty
      HAVING SUM(s.Qtty) > 0.0005`
   );
 
@@ -822,18 +925,32 @@ export async function traspasos(pool, ctx, q) {
     if (ranking[0]) almLids.add(ranking[0].id);
   }
 
-  // Stock index: gid -> { pv: cant, alm: cant, nombre, ... }
+  // Stock index + inversión por local
   const idx = new Map();
+  const inversionPorLocal = {};
+  let inversionTotal = 0;
   for (const s of stockPorLocal) {
     const gid = num(s.gid);
+    const costoU = costoDe(s.costo, s.precio, pctCosto);
+    const cant = num(s.cant);
+    const inv = cant * costoU;
+    inversionTotal += inv;
+    const L = s.local || "Sin local";
+    if (!inversionPorLocal[L]) inversionPorLocal[L] = { local: L, lid: num(s.lid), piezas: 0, inversion: 0, refs: 0, esPv: pvLids.has(num(s.lid)), esAlm: almLids.has(num(s.lid)) };
+    inversionPorLocal[L].piezas += cant;
+    inversionPorLocal[L].inversion += inv;
+    inversionPorLocal[L].refs += 1;
+
     if (!idx.has(gid)) {
       idx.set(gid, {
         id: gid,
         codigo: s.codigo,
         nombre: s.nombre,
         familia: s.familia,
-        costo: num(s.costo),
+        costo: costoU,
+        costoReal: num(s.costo) > 0,
         precio: num(s.precio),
+        minimo: num(s.minimo),
         enPv: 0,
         enAlm: 0,
         detallePv: [],
@@ -841,7 +958,7 @@ export async function traspasos(pool, ctx, q) {
       });
     }
     const row = idx.get(gid);
-    const cant = num(s.cant);
+    if (num(s.minimo) > row.minimo) row.minimo = num(s.minimo);
     const lid = num(s.lid);
     if (pvLids.has(lid)) {
       row.enPv += cant;
@@ -856,31 +973,37 @@ export async function traspasos(pool, ctx, q) {
   const sugerencias = [];
   for (const row of idx.values()) {
     const diaria = demanda.get(row.id) || 0;
-    if (diaria <= 0 && row.enPv > 0) continue; // no se vende y ya hay en PV
-    if (row.enAlm <= 0.0005) continue; // nada en almacén
-    const coberturaPv = diaria > 0 ? row.enPv / diaria : (row.enPv > 0 ? 999 : 0);
-    // Hace falta si cobertura en PV < días objetivo, o está agotado en PV y se vende
-    if (diaria > 0 && coberturaPv >= diasObjetivo) continue;
-    if (diaria <= 0) continue;
-    const objetivo = diaria * diasObjetivo;
-    let pedir = Math.max(0, objetivo - row.enPv);
+    if (row.enAlm <= 0.0005) continue;
+    // Objetivo en PV: el mayor entre mínimo de ficha, stock nominal por días de cobertura, y el mínimo operativo
+    const porCobertura = diaria > 0 ? diaria * diasObjetivo : 0;
+    const minimo = row.minimo > 0 ? row.minimo : 0;
+    // Stock nominal ≈ cobertura por venta; si no hay venta pero hay mínimo, usar el mínimo
+    const nominal = Math.max(porCobertura, minimo);
+    if (nominal <= 0) continue; // sin mínimo ni venta: no sugerir
+    if (row.enPv >= nominal - 0.0005) continue; // ya tiene suficiente en PV
+    let pedir = nominal - row.enPv;
     pedir = Math.min(pedir, row.enAlm);
     pedir = redondear(pedir, 2);
-    if (pedir < 0.5 && row.enPv > 0.0005) continue;
     if (pedir < 0.01) continue;
-    const urgencia = coberturaPv <= 3 ? "alta" : coberturaPv <= 7 ? "media" : "baja";
+    const coberturaPv = diaria > 0 ? row.enPv / diaria : (row.enPv > 0 ? 999 : 0);
+    const bajoMinimo = minimo > 0 && row.enPv < minimo;
+    const urgencia = bajoMinimo || coberturaPv <= 3 ? "alta" : coberturaPv <= 7 || (minimo > 0 && row.enPv < minimo * 1.5) ? "media" : "baja";
     sugerencias.push({
       id: row.id,
       codigo: row.codigo,
       nombre: row.nombre,
       familia: row.familia,
       diaria: redondear(diaria, 2),
+      minimo: redondear(minimo, 2),
+      nominal: redondear(nominal, 2),
       enPv: redondear(row.enPv, 2),
       enAlm: redondear(row.enAlm, 2),
       coberturaPv: redondear(coberturaPv, 1),
       sugerido: pedir,
-      valorCosto: redondear(pedir * (row.costo > 0 ? row.costo : 0)),
+      valorCosto: redondear(pedir * row.costo),
+      costoEstimado: !row.costoReal,
       urgencia,
+      motivo: bajoMinimo ? "Bajo el mínimo de ficha" : porCobertura >= minimo ? "Cubrir días de venta" : "Alcanzar mínimo",
       desde: row.detalleAlm.map((d) => `${d.local}: ${redondear(d.cant, 1)}`).join(", "),
       hacia: row.detallePv.map((d) => `${d.local}: ${redondear(d.cant, 1)}`).join(", ") || "Punto de venta",
     });
@@ -903,8 +1026,22 @@ export async function traspasos(pool, ctx, q) {
   return {
     dias,
     diasObjetivo,
+    costoEstimadoPct: pctCosto,
     puntosVenta: localesPv,
     almacenes: localesAlm,
+    inversion: {
+      total: redondear(inversionTotal),
+      porLocal: Object.values(inversionPorLocal)
+        .map((x) => ({
+          local: x.local,
+          lid: x.lid,
+          piezas: redondear(x.piezas, 2),
+          inversion: redondear(x.inversion),
+          refs: x.refs,
+          tipo: x.esPv && x.esAlm ? "mixto" : x.esPv ? "punto de venta" : x.esAlm ? "almacén" : "otro",
+        }))
+        .sort((a, b) => b.inversion - a.inversion),
+    },
     resumen: {
       productos: sugerencias.length,
       unidades: redondear(sugerencias.reduce((s, x) => s + x.sugerido, 0), 1),
@@ -935,6 +1072,24 @@ export async function caja(pool, ctx, q) {
      WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)${filtroU} ORDER BY sh.DateTimeOpen DESC`,
     params
   );
+  // Desglose de cobros por turno y forma de pago (Mode típico AxisPOS: 1 efectivo, otros tarjeta/transfer)
+  const pagosModo = await filas(
+    pool,
+    `SELECT p.ShiftID AS sid, p.Mode AS modo, SUM(p.Qtty) AS total, COUNT(*) AS n
+     FROM payments p
+     JOIN shift sh ON sh.ID = p.ShiftID
+     WHERE p.OperType = 2 AND sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)
+     GROUP BY p.ShiftID, p.Mode`,
+    [desde, hasta]
+  ).catch(() => []);
+  const pagosPorTurno = new Map();
+  for (const x of pagosModo) {
+    const sid = num(x.sid);
+    if (!pagosPorTurno.has(sid)) pagosPorTurno.set(sid, []);
+    const modo = num(x.modo);
+    const nombre = modo === 1 ? "Efectivo" : modo === 2 ? "Tarjeta" : modo === 3 ? "Transferencia" : `Modo ${modo}`;
+    pagosPorTurno.get(sid).push({ modo, nombre, total: num(x.total), n: num(x.n) });
+  }
   const turnos = todos.map((t) => {
     const ventas = num(t.ventas), dev = num(t.devoluciones), contado = num(t.contado);
     const esperado = num(t.inicial) + ventas - dev - num(t.retiro);
@@ -942,10 +1097,17 @@ export async function caja(pool, ctx, q) {
     const dif = cerrado ? redondear(contado - esperado) : null;
     const difPagos = redondear(ventas - num(t.pagos));
     const nivel = dif == null ? null : Math.abs(dif) > tol * 10 ? "alta" : Math.abs(dif) > tol ? "media" : "ok";
+    const cobros = pagosPorTurno.get(num(t.id)) || [];
+    const cobrosMap = Object.fromEntries(cobros.map((c) => [c.nombre, c.total]));
     return {
       id: t.id, local: t.local, usuario: t.usuario, apertura: t.apertura, cierre: t.cierre, tickets: num(t.tickets),
       ventas, devoluciones: dev, retiro: num(t.retiro), inicial: num(t.inicial), esperado: redondear(esperado), contado,
       diferencia: dif, nivel, difAxis: num(t.difAxis), pagos: num(t.pagos), difPagos, sinCierre: !cerrado && !!t.cierre,
+      cobros,
+      efectivo: cobrosMap.Efectivo || 0,
+      tarjeta: cobrosMap.Tarjeta || 0,
+      transferencia: cobrosMap.Transferencia || 0,
+      horasTurno: t.cierre && t.apertura ? redondear((new Date(t.cierre.replace(" ", "T")) - new Date(t.apertura.replace(" ", "T"))) / 3600000, 2) : null,
     };
   });
   const [[dv], formas] = await Promise.all([
@@ -1498,4 +1660,681 @@ export async function comprobarPermisos(pool) {
   } catch {
     return "desconocido";
   }
+}
+
+// ========== Amplaciones: devoluciones, antigüedad, traspasos hechos, físico, margen, productividad ==========
+
+export async function devolucionesDetalle(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  const lista = await filas(
+    pool,
+    `SELECT o.Acct AS acct, ${F} AS fecha, g.Name AS nombre, g.Code AS codigo, ABS(o.Qtty) AS cant,
+            ${IMP} AS importe, u.Name AS usuario, o.Note AS nota, COALESCE(obj.Name,'') AS local
+     FROM operations o
+     LEFT JOIN goods g ON g.ID = o.GoodID
+     LEFT JOIN users u ON u.ID = o.UserID
+     LEFT JOIN shift sh ON sh.ID = o.ShiftID
+     LEFT JOIN objects obj ON obj.ID = sh.ObjectID
+     WHERE ${DEVOL} AND ${RANGO}
+     ORDER BY fecha DESC LIMIT 500`,
+    [desde, hasta]
+  );
+  const porProd = {};
+  const porUser = {};
+  let total = 0, unidades = 0;
+  for (const x of lista) {
+    const imp = num(x.importe), c = num(x.cant);
+    total += imp; unidades += c;
+    const k = x.nombre || "?";
+    if (!porProd[k]) porProd[k] = { nombre: k, codigo: x.codigo, cant: 0, importe: 0, n: 0 };
+    porProd[k].cant += c; porProd[k].importe += imp; porProd[k].n++;
+    const u = x.usuario || "Sin nombre";
+    if (!porUser[u]) porUser[u] = { usuario: u, cant: 0, importe: 0, n: 0 };
+    porUser[u].cant += c; porUser[u].importe += imp; porUser[u].n++;
+  }
+  return {
+    desde, hasta, total: redondear(total), unidades: redondear(unidades, 2), movimientos: lista.length,
+    porProducto: Object.values(porProd).sort((a, b) => b.importe - a.importe).slice(0, 40),
+    porUsuario: Object.values(porUser).sort((a, b) => b.importe - a.importe),
+    filas: lista.map((x) => ({
+      ticket: numTicket(x.acct), acct: num(x.acct), fecha: x.fecha, nombre: x.nombre, codigo: x.codigo,
+      cant: num(x.cant), importe: num(x.importe), usuario: x.usuario, nota: x.nota || "", local: x.local,
+    })),
+  };
+}
+
+export async function antiguedadStock(pool, ctx) {
+  const pct = ctx.aj?.costoEstimadoPct ?? 10;
+  const hasta = ctx.r.ultimo;
+  const ultVenta = await filas(
+    pool,
+    `SELECT o.GoodID AS id, MAX(DATE_FORMAT(${F},'%Y-%m-%d')) AS ultima
+     FROM operations o WHERE ${VENTA} GROUP BY o.GoodID`
+  );
+  const mapaUlt = new Map(ultVenta.map((x) => [num(x.id), x.ultima]));
+  const stock = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
+            SUM(s.Qtty) AS stock, g.PriceIn AS costo, ${PRECIO} AS precio
+     FROM store s JOIN goods g ON g.ID = s.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
+     WHERE COALESCE(g.Deleted,0)=0 GROUP BY g.ID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     HAVING SUM(s.Qtty) > 0.0005`
+  );
+  const buckets = { d0_30: [], d31_60: [], d61_90: [], d90: [], nunca: [] };
+  let capital = { d0_30: 0, d31_60: 0, d61_90: 0, d90: 0, nunca: 0 };
+  for (const x of stock) {
+    const st = num(x.stock);
+    const costoU = costoDe(x.costo, x.precio, pct);
+    const val = st * costoU;
+    const ultima = mapaUlt.get(num(x.id));
+    let dias = null, bucket = "nunca";
+    if (ultima) {
+      dias = difDias(ultima, hasta);
+      if (dias <= 30) bucket = "d0_30";
+      else if (dias <= 60) bucket = "d31_60";
+      else if (dias <= 90) bucket = "d61_90";
+      else bucket = "d90";
+    }
+    const row = {
+      id: x.id, codigo: x.codigo, nombre: x.nombre, familia: x.familia,
+      stock: redondear(st, 2), valor: redondear(val), ultima: ultima || null, dias,
+    };
+    buckets[bucket].push(row);
+    capital[bucket] += val;
+  }
+  for (const k of Object.keys(buckets)) buckets[k].sort((a, b) => b.valor - a.valor);
+  return {
+    hasta,
+    resumen: {
+      d0_30: { n: buckets.d0_30.length, capital: redondear(capital.d0_30) },
+      d31_60: { n: buckets.d31_60.length, capital: redondear(capital.d31_60) },
+      d61_90: { n: buckets.d61_90.length, capital: redondear(capital.d61_90) },
+      d90: { n: buckets.d90.length, capital: redondear(capital.d90) },
+      nunca: { n: buckets.nunca.length, capital: redondear(capital.nunca) },
+    },
+    filas90: buckets.d90.slice(0, 80),
+    filasNunca: buckets.nunca.slice(0, 80),
+    filas61: buckets.d61_90.slice(0, 40),
+  };
+}
+
+export async function traspasosHechos(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  // OperTypes de transferencia típicos Microinvest: 7, 26, 27
+  const lista = await filas(
+    pool,
+    `SELECT ${F} AS fecha, o.OperType AS tipo, g.Name AS nombre, g.Code AS codigo,
+            ABS(o.Qtty) AS cant, u.Name AS usuario, o.Note AS nota, o.Acct AS acct,
+            COALESCE(obj.Name,'') AS local
+     FROM operations o
+     LEFT JOIN goods g ON g.ID = o.GoodID
+     LEFT JOIN users u ON u.ID = o.UserID
+     LEFT JOIN shift sh ON sh.ID = o.ShiftID
+     LEFT JOIN objects obj ON obj.ID = sh.ObjectID
+     WHERE o.OperType IN (7, 26, 27) AND ${RANGO}
+     ORDER BY fecha DESC LIMIT 500`,
+    [desde, hasta]
+  ).catch(() => []);
+  const porProd = {};
+  let unidades = 0;
+  for (const x of lista) {
+    unidades += num(x.cant);
+    const k = x.nombre || "?";
+    if (!porProd[k]) porProd[k] = { nombre: k, cant: 0, n: 0 };
+    porProd[k].cant += num(x.cant); porProd[k].n++;
+  }
+  return {
+    desde, hasta, movimientos: lista.length, unidades: redondear(unidades, 2),
+    porProducto: Object.values(porProd).sort((a, b) => b.cant - a.cant).slice(0, 30),
+    filas: lista.map((x) => ({
+      fecha: x.fecha, tipo: num(x.tipo), nombreTipo: NOMBRE_OPER[num(x.tipo)] || `Tipo ${x.tipo}`,
+      nombre: x.nombre, codigo: x.codigo, cant: num(x.cant), usuario: x.usuario, nota: x.nota || "", local: x.local,
+    })),
+  };
+}
+
+/** Catálogo stock en vivo para Arqueo Stock (mismo formato que espera la app de conteo). */
+export async function stockVivo(pool) {
+  const lista = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Code AS sku, g.Name AS nombre, ${PRECIO} AS precio, COALESCE(SUM(s.Qtty),0) AS stock
+     FROM goods g
+     LEFT JOIN store s ON s.GoodID = g.ID
+     WHERE COALESCE(g.Deleted,0)=0
+     GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     HAVING ABS(COALESCE(SUM(s.Qtty),0)) > 0.0005 OR 1=1
+     ORDER BY g.Name
+     LIMIT 20000`
+  );
+  const items = lista.map((x) => ({
+    sku: x.sku || String(x.id),
+    nombre: x.nombre,
+    stock: num(x.stock),
+    precio: num(x.precio),
+  }));
+  return { items, n: items.length, ts: Date.now() };
+}
+
+/** Compara conteo físico (JSON de Arqueo) con stock del sistema. */
+export async function inventarioFisico(pool, ctx, body) {
+  const pct = ctx.aj?.costoEstimadoPct ?? 10;
+  const conteos = Array.isArray(body?.items) ? body.items : Array.isArray(body) ? body : [];
+  const stock = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(SUM(s.Qtty),0) AS sistema,
+            g.PriceIn AS costo, ${PRECIO} AS precio
+     FROM goods g LEFT JOIN store s ON s.GoodID = g.ID
+     WHERE COALESCE(g.Deleted,0)=0
+     GROUP BY g.ID, g.Code, g.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3`
+  );
+  const bySku = new Map();
+  const byNom = new Map();
+  for (const x of stock) {
+    const row = {
+      id: x.id, codigo: x.codigo, nombre: x.nombre, sistema: num(x.sistema),
+      costo: costoDe(x.costo, x.precio, pct), precio: num(x.precio),
+    };
+    if (x.codigo) bySku.set(String(x.codigo).trim().toLowerCase(), row);
+    byNom.set(String(x.nombre || "").trim().toLowerCase(), row);
+  }
+  const filasOut = [];
+  let faltante = 0, sobrante = 0, ok = 0, valorFaltante = 0, valorSobrante = 0;
+  for (const c of conteos) {
+    const sku = String(c.codigo || c.sku || "").trim().toLowerCase();
+    const nom = String(c.nombre || "").trim().toLowerCase();
+    const fisico = c.stockReal != null ? num(c.stockReal) : (num(c.stockCuarto) + num(c.stockPlaca));
+    if (c.stockReal == null && c.stockCuarto == null && c.stockPlaca == null) continue;
+    let sys = (sku && bySku.get(sku)) || (nom && byNom.get(nom)) || null;
+    const sistema = sys ? sys.sistema : 0;
+    const dif = redondear(fisico - sistema, 3);
+    const costoU = sys ? sys.costo : 0;
+    const val = dif * costoU;
+    if (Math.abs(dif) < 0.001) ok++;
+    else if (dif < 0) { faltante++; valorFaltante += val; }
+    else { sobrante++; valorSobrante += val; }
+    filasOut.push({
+      nombre: (sys && sys.nombre) || c.nombre || sku,
+      codigo: (sys && sys.codigo) || c.codigo || c.sku || "",
+      sistema: redondear(sistema, 3),
+      fisico: redondear(fisico, 3),
+      diferencia: dif,
+      valor: redondear(val),
+      estado: Math.abs(dif) < 0.001 ? "ok" : dif < 0 ? "faltante" : "sobrante",
+    });
+  }
+  filasOut.sort((a, b) => Math.abs(b.diferencia) - Math.abs(a.diferencia));
+  return {
+    resumen: {
+      comparados: filasOut.length, ok, faltante, sobrante,
+      valorFaltante: redondear(valorFaltante), valorSobrante: redondear(valorSobrante),
+    },
+    filas: filasOut.slice(0, 300),
+  };
+}
+
+export async function margenProductos(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  const pct = ctx.aj?.costoEstimadoPct ?? 10;
+  const lista = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
+            SUM(ABS(o.Qtty)) AS unidades, SUM(${IMP}) AS ventas,
+            SUM(ABS(o.Qtty) * COALESCE(NULLIF(o.PriceIn,0), NULLIF(g.PriceIn,0), 0)) AS costoReal
+     FROM operations o
+     LEFT JOIN goods g ON g.ID = o.GoodID
+     LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
+     WHERE ${VENTA} AND ${RANGO}
+     GROUP BY g.ID, g.Name, gg.Name
+     ORDER BY ventas DESC LIMIT 200`,
+    [desde, hasta]
+  );
+  // Si costo real 0, estimar con % del precio medio implícito
+  const filasOut = lista.map((x) => {
+    const ventas = num(x.ventas), unidades = num(x.unidades);
+    let costo = num(x.costoReal);
+    let estimado = false;
+    if (costo <= 0 && ventas > 0) {
+      costo = ventas * (1 - Math.min(Math.max(pct, 0), 99) / 100);
+      estimado = true;
+    }
+    const ganancia = ventas - costo;
+    return {
+      id: x.id, nombre: x.nombre, familia: x.familia, unidades: redondear(unidades, 2),
+      ventas: redondear(ventas), costo: redondear(costo), ganancia: redondear(ganancia),
+      margen: ventas > 0 ? ganancia / ventas : 0, estimado,
+    };
+  });
+  const porFam = {};
+  for (const x of filasOut) {
+    if (!porFam[x.familia]) porFam[x.familia] = { familia: x.familia, ventas: 0, costo: 0, ganancia: 0 };
+    porFam[x.familia].ventas += x.ventas;
+    porFam[x.familia].costo += x.costo;
+    porFam[x.familia].ganancia += x.ganancia;
+  }
+  return {
+    desde, hasta, costoEstimadoPct: pct,
+    familias: Object.values(porFam).map((f) => ({
+      ...f, margen: f.ventas > 0 ? f.ganancia / f.ventas : 0,
+    })).sort((a, b) => b.ganancia - a.ganancia),
+    filas: filasOut,
+  };
+}
+
+export async function efectoPrecios(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  // Mitad del período
+  const dias = Math.max(ctx.r.dias || 30, 2);
+  const mitad = sumarDias(desde, Math.floor(dias / 2) - 1);
+  const [antes, despues] = await Promise.all([
+    filas(pool, `SELECT o.GoodID AS id, g.Name AS nombre, AVG(o.PriceOut) AS precio, SUM(ABS(o.Qtty)) AS unid, SUM(${IMP}) AS total
+      FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID
+      WHERE ${VENTA} AND ${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY) GROUP BY o.GoodID, g.Name`, [desde, mitad]),
+    filas(pool, `SELECT o.GoodID AS id, g.Name AS nombre, AVG(o.PriceOut) AS precio, SUM(ABS(o.Qtty)) AS unid, SUM(${IMP}) AS total
+      FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID
+      WHERE ${VENTA} AND ${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY) GROUP BY o.GoodID, g.Name`, [sumarDias(mitad, 1), hasta]),
+  ]);
+  const mapA = new Map(antes.map((x) => [num(x.id), x]));
+  const mapB = new Map(despues.map((x) => [num(x.id), x]));
+  const filasOut = [];
+  for (const [id, a] of mapA) {
+    const b = mapB.get(id);
+    if (!b) continue;
+    const pa = num(a.precio), pb = num(b.precio);
+    if (pa <= 0 || Math.abs(pb - pa) / pa < 0.02) continue; // cambio < 2%
+    filasOut.push({
+      id, nombre: a.nombre || b.nombre,
+      precioAntes: redondear(pa), precioDespues: redondear(pb),
+      cambioPct: (pb - pa) / pa,
+      unidAntes: num(a.unid), unidDespues: num(b.unid),
+      ventasAntes: num(a.total), ventasDespues: num(b.total),
+      varUnid: num(a.unid) > 0 ? (num(b.unid) - num(a.unid)) / num(a.unid) : null,
+    });
+  }
+  filasOut.sort((a, b) => Math.abs(b.cambioPct) - Math.abs(a.cambioPct));
+  return { desde, hasta, corte: mitad, filas: filasOut.slice(0, 80) };
+}
+
+export async function productividad(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  const turnos = await filas(
+    pool,
+    `SELECT sh.ID AS id, u.Name AS usuario, sh.DateTimeOpen AS ap, sh.DateTimeClose AS ci,
+            COALESCE(v.tickets,0) AS tickets, COALESCE(v.total,0) AS ventas, COALESCE(v.unid,0) AS unid
+     FROM shift sh
+     LEFT JOIN users u ON u.ID = sh.UserID
+     LEFT JOIN (
+       SELECT o.ShiftID, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total, SUM(ABS(o.Qtty)) AS unid
+       FROM operations o WHERE ${VENTA} GROUP BY o.ShiftID
+     ) v ON v.ShiftID = sh.ID
+     WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)
+     ORDER BY sh.DateTimeOpen DESC LIMIT 300`,
+    [desde, hasta]
+  );
+  const porUser = {};
+  for (const t of turnos) {
+    const u = t.usuario || "Sin nombre";
+    if (!porUser[u]) porUser[u] = { usuario: u, turnos: 0, horas: 0, tickets: 0, ventas: 0, unid: 0 };
+    const c = porUser[u];
+    c.turnos++;
+    c.tickets += num(t.tickets);
+    c.ventas += num(t.ventas);
+    c.unid += num(t.unid);
+    if (t.ap && t.ci) {
+      const h = (new Date(String(t.ci).replace(" ", "T")) - new Date(String(t.ap).replace(" ", "T"))) / 3600000;
+      if (h > 0 && h < 24) c.horas += h;
+    }
+  }
+  const filasOut = Object.values(porUser).map((c) => ({
+    ...c,
+    horas: redondear(c.horas, 1),
+    ticketsHora: c.horas > 0 ? redondear(c.tickets / c.horas, 2) : null,
+    ventasHora: c.horas > 0 ? redondear(c.ventas / c.horas) : null,
+    unidTicket: c.tickets > 0 ? redondear(c.unid / c.tickets, 2) : null,
+    ticketMedio: c.tickets > 0 ? redondear(c.ventas / c.tickets) : null,
+  })).sort((a, b) => (b.ventasHora || 0) - (a.ventasHora || 0));
+  return { desde, hasta, filas: filasOut };
+}
+
+export async function patronesAnulacion(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  // Cancelaciones desde systemlog + líneas
+  let logs = [];
+  try {
+    logs = await filas(
+      pool,
+      `SELECT DATE_FORMAT(l.DateTime,'%Y-%m-%d %H:%i:%s') AS fecha, HOUR(l.DateTime) AS hora,
+              u.Name AS usuario, l.Message AS mensaje
+       FROM systemlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE l.DateTime >= ? AND l.DateTime < DATE_ADD(?, INTERVAL 1 DAY)
+         AND (l.Message LIKE '%cancel%' OR l.Message LIKE '%anul%' OR l.Message LIKE '%void%' OR l.Message LIKE '%elimin%')
+       ORDER BY l.DateTime DESC LIMIT 1000`,
+      [desde, hasta]
+    );
+  } catch { logs = []; }
+  const porHora = Array.from({ length: 24 }, (_, h) => ({ hora: h, n: 0 }));
+  const porUser = {};
+  for (const x of logs) {
+    const h = num(x.hora);
+    if (h >= 0 && h < 24) porHora[h].n++;
+    const u = x.usuario || "Sin nombre";
+    if (!porUser[u]) porUser[u] = { usuario: u, n: 0 };
+    porUser[u].n++;
+  }
+  return {
+    desde, hasta, total: logs.length,
+    porHora,
+    porUsuario: Object.values(porUser).sort((a, b) => b.n - a.n),
+    recientes: logs.slice(0, 40).map((x) => ({ fecha: x.fecha, usuario: x.usuario, mensaje: (x.mensaje || "").slice(0, 120) })),
+  };
+}
+
+export async function duracionTurnos(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  const lista = await filas(
+    pool,
+    `SELECT sh.ID AS id, u.Name AS usuario, o.Name AS local,
+            DATE_FORMAT(sh.DateTimeOpen,'%Y-%m-%d %H:%i:%s') AS apertura,
+            DATE_FORMAT(sh.DateTimeClose,'%Y-%m-%d %H:%i:%s') AS cierre
+     FROM shift sh
+     LEFT JOIN users u ON u.ID = sh.UserID
+     LEFT JOIN objects o ON o.ID = sh.ObjectID
+     WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)
+     ORDER BY sh.DateTimeOpen DESC LIMIT 200`,
+    [desde, hasta]
+  );
+  const filasOut = lista.map((t) => {
+    let horas = null;
+    if (t.apertura && t.cierre) {
+      horas = (new Date(t.cierre.replace(" ", "T")) - new Date(t.apertura.replace(" ", "T"))) / 3600000;
+      if (horas < 0 || horas > 36) horas = null;
+    }
+    const alerta = horas != null && (horas > 12 || horas < 0.5);
+    return {
+      id: t.id, usuario: t.usuario, local: t.local, apertura: t.apertura, cierre: t.cierre,
+      horas: horas != null ? redondear(horas, 2) : null,
+      abierto: !t.cierre,
+      alerta,
+    };
+  });
+  return {
+    desde, hasta,
+    abiertos: filasOut.filter((x) => x.abierto).length,
+    largos: filasOut.filter((x) => x.horas != null && x.horas > 12).length,
+    filas: filasOut,
+  };
+}
+
+export async function alertasInicio(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  const tol = ctx.aj.tolCierre;
+  const [cajaData, alertas, merma] = await Promise.all([
+    caja(pool, ctx, { pagina: 1 }),
+    alertasStock(pool, ctx).catch(() => ({ resumen: {} })),
+    mermas(pool, ctx).catch(() => ({ total: 0, movimientos: 0 })),
+  ]);
+  const items = [];
+  if (cajaData.conDiferencia > 0) {
+    items.push({ nivel: "alta", texto: `${cajaData.conDiferencia} turnos fuera de tolerancia de caja (${tol} CUP). Faltante acum. ${Math.abs(cajaData.faltante).toFixed(0)} CUP.` });
+  }
+  if (alertas.resumen?.agotados > 0) {
+    items.push({ nivel: "alta", texto: `${alertas.resumen.agotados} productos agotados que se estaban vendiendo.` });
+  }
+  if (alertas.resumen?.reorden > 0) {
+    items.push({ nivel: "media", texto: `${alertas.resumen.reorden} productos en punto de reposición.` });
+  }
+  if (merma.movimientos > 0) {
+    items.push({ nivel: "media", texto: `Mermas del período: ${merma.movimientos} mov. · valor ~ ${Number(merma.total).toFixed(0)} CUP.` });
+  }
+  if (!items.length) items.push({ nivel: "ok", texto: "Sin alertas fuertes en el período seleccionado." });
+  return { items, caja: { conDiferencia: cajaData.conDiferencia, faltante: cajaData.faltante }, stock: alertas.resumen || {} };
+}
+
+export async function panelDueno(pool, ctx) {
+  const { desde, hasta, ultimo } = ctx.r;
+  const [res, cajaData, alertas, top, merma] = await Promise.all([
+    resumen(pool, ctx),
+    caja(pool, ctx, { pagina: 1 }),
+    alertasStock(pool, ctx).catch(() => ({ resumen: { agotados: 0, reorden: 0 }, filas: [] })),
+    topProductos(pool, ctx, { limite: 5 }),
+    mermas(pool, ctx).catch(() => ({ total: 0 })),
+  ]);
+  return {
+    desde, hasta, ultimoDia: ultimo,
+    ventasHoy: res.tiempoReal?.hoy ?? 0,
+    ventasPeriodo: res.total,
+    tickets: res.tickets,
+    ganancia: res.ganancia ?? null,
+    margen: res.margen ?? null,
+    caja: { conDiferencia: cajaData.conDiferencia, faltante: cajaData.faltante, sobrante: cajaData.sobrante },
+    stockCritico: (alertas.filas || []).filter((x) => x.nivel === "alta").slice(0, 8),
+    top: top.filas || [],
+    mermas: merma.total || 0,
+  };
+}
+
+// ========== Comparar períodos, lista arqueo, ranking, diagnóstico ==========
+
+export async function compararPeriodos(pool, ctx, q) {
+  const d1 = q.desde1 || ctx.r.desde;
+  const h1 = q.hasta1 || ctx.r.hasta;
+  const d2 = q.desde2;
+  const h2 = q.hasta2;
+  if (!d2 || !h2) return { error: "Indica el segundo período (desde2, hasta2)" };
+  async function bloque(desde, hasta) {
+    const ctx2 = { ...ctx, r: { ...ctx.r, desde, hasta, primero: desde, ultimo: hasta } };
+    const [ventasR, ticketsR, cajaR] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(${IMP}),0) AS t, COUNT(DISTINCT o.Acct) AS n FROM operations o WHERE ${VENTA} AND ${RANGO}`, [desde, hasta]),
+      pool.query(`SELECT COUNT(DISTINCT o.Acct) AS n FROM operations o WHERE ${VENTA} AND ${RANGO}`, [desde, hasta]),
+      caja(pool, { ...ctx, r: { desde, hasta, primero: desde, ultimo: hasta } }, { pagina: 1 }).catch(() => null),
+    ]);
+    const total = num(ventasR[0][0].t);
+    const tickets = num(ventasR[0][0].n);
+    return {
+      desde, hasta, total, tickets,
+      ticketMedio: tickets > 0 ? redondear(total / tickets) : 0,
+      cajaFuera: cajaR?.conDiferencia || 0,
+      faltante: cajaR?.faltante || 0,
+    };
+  }
+  const [a, b] = await Promise.all([bloque(d1, h1), bloque(d2, h2)]);
+  const varPct = (x, y) => (y > 0 ? (x - y) / y : null);
+  return {
+    a, b,
+    delta: {
+      total: redondear(a.total - b.total),
+      totalPct: varPct(a.total, b.total),
+      tickets: a.tickets - b.tickets,
+      ticketsPct: varPct(a.tickets, b.tickets),
+      ticketMedio: redondear(a.ticketMedio - b.ticketMedio),
+    },
+  };
+}
+
+/** Lista filtrada para Arqueo Stock (JSON listo para importar / conteo). */
+export async function listaArqueo(pool, ctx, q) {
+  const lid = q.local ? parseInt(q.local, 10) : null;
+  const soloMin = q.soloMin === "1" || q.soloMin === "true";
+  const clase = q.clase || ""; // A/B/C o vacío
+  const pct = ctx.aj?.costoEstimadoPct ?? 10;
+
+  let abcIds = null;
+  if (clase) {
+    const abc = await analisisABC(pool, ctx, { clase }).catch(() => null);
+    if (abc?.filas) abcIds = new Set(abc.filas.map((x) => num(x.id)));
+  }
+
+  const stock = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Code AS sku, g.Name AS nombre, ${PRECIO} AS precio,
+            COALESCE(SUM(s.Qtty),0) AS stock, g.MinQtty AS minimo, o.Name AS local, s.ObjectID AS lid
+     FROM store s
+     JOIN goods g ON g.ID = s.GoodID
+     LEFT JOIN objects o ON o.ID = s.ObjectID
+     WHERE COALESCE(g.Deleted,0)=0 ${lid ? "AND s.ObjectID = ?" : ""}
+     GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.MinQtty, o.Name, s.ObjectID
+     HAVING ABS(COALESCE(SUM(s.Qtty),0)) > 0.0005 OR 1=1
+     ORDER BY g.Name
+     LIMIT 15000`,
+    lid ? [lid] : []
+  );
+
+  // Agregar por producto (suma locales si no se filtró)
+  const map = new Map();
+  for (const x of stock) {
+    if (abcIds && !abcIds.has(num(x.id))) continue;
+    const st = num(x.stock);
+    if (soloMin && st > num(x.minimo) && num(x.minimo) > 0) continue;
+    if (soloMin && num(x.minimo) <= 0 && st > 0) continue;
+    const k = num(x.id);
+    if (!map.has(k)) {
+      map.set(k, {
+        sku: x.sku || String(x.id),
+        nombre: x.nombre,
+        stock: 0,
+        precio: num(x.precio),
+        minimo: num(x.minimo),
+      });
+    }
+    map.get(k).stock += st;
+  }
+  const items = [...map.values()].map((x) => ({
+    sku: x.sku,
+    nombre: x.nombre,
+    stock: redondear(x.stock, 3),
+    precio: x.precio,
+  }));
+  return {
+    generado: new Date().toISOString(),
+    filtros: { local: lid, soloMin, clase },
+    n: items.length,
+    items,
+  };
+}
+
+/** Tras el arqueo: informe de ajustes sugeridos (para capturar en AxisPOS, sin escribir BD). */
+export async function ajustesSugeridos(pool, ctx, body) {
+  const fisico = await inventarioFisico(pool, ctx, body);
+  const sugeridos = (fisico.filas || [])
+    .filter((x) => Math.abs(x.diferencia) >= 0.001)
+    .map((x) => ({
+      codigo: x.codigo,
+      nombre: x.nombre,
+      sistema: x.sistema,
+      fisico: x.fisico,
+      diferencia: x.diferencia,
+      valor: x.valor,
+      accion: x.diferencia < 0
+        ? `Bajar stock en ${Math.abs(x.diferencia)} (faltante físico)`
+        : `Subir stock en ${x.diferencia} (sobrante físico)`,
+      tipoAxis: x.diferencia < 0 ? "Merma / ajuste negativo" : "Ajuste positivo / entrada",
+    }));
+  return {
+    resumen: fisico.resumen,
+    mensaje: "Este informe no modifica AxisPOS. Úsalo para capturar los ajustes manualmente en el POS.",
+    filas: sugeridos,
+  };
+}
+
+export async function rankingEquipo(pool, ctx) {
+  const [prod, cajaData, pat] = await Promise.all([
+    productividad(pool, ctx),
+    caja(pool, ctx, { pagina: 1, todo: 1 }).catch(() => ({ porCajero: [] })),
+    patronesAnulacion(pool, ctx).catch(() => ({ porUsuario: [] })),
+  ]);
+  const anMap = Object.fromEntries((pat.porUsuario || []).map((x) => [x.usuario, x.n]));
+  const cajaMap = Object.fromEntries((cajaData.porCajero || []).map((x) => [x.usuario, x]));
+  const filas = (prod.filas || []).map((x) => {
+    const señales = [];
+    const c = cajaMap[x.usuario];
+    if (c && c.faltante < -ctx.aj.tolCierre) señales.push({ nivel: "alta", texto: `Faltante caja ${Math.abs(c.faltante).toFixed(0)} CUP` });
+    if (c && c.conDif >= 3) señales.push({ nivel: "media", texto: `${c.conDif} turnos fuera de tolerancia` });
+    const an = anMap[x.usuario] || 0;
+    if (an >= 5) señales.push({ nivel: "media", texto: `${an} anulaciones/cancelaciones` });
+    if (x.ticketsHora != null && x.ticketsHora < 2 && x.horas > 4) señales.push({ nivel: "media", texto: "Baja productividad (tickets/h)" });
+    return { ...x, señales, nSenales: señales.length };
+  });
+  filas.sort((a, b) => b.nSenales - a.nSenales || (b.ventasHora || 0) - (a.ventasHora || 0));
+  return { desde: ctx.r.desde, hasta: ctx.r.hasta, filas };
+}
+
+export async function turnosHorario(pool, ctx) {
+  const base = await duracionTurnos(pool, ctx);
+  const hMin = ctx.aj.horaAperturaMin ?? 7;
+  const hMax = ctx.aj.horaAperturaMax ?? 10;
+  const hMaxTurno = ctx.aj.horasTurnoMax ?? 12;
+  const filas = base.filas.map((t) => {
+    const flags = [];
+    if (t.abierto) flags.push("Sin cerrar");
+    if (t.horas != null && t.horas > hMaxTurno) flags.push(`Más de ${hMaxTurno} h`);
+    if (t.apertura) {
+      const h = parseInt(String(t.apertura).slice(11, 13), 10);
+      if (!Number.isNaN(h) && (h < hMin || h > hMax)) flags.push(`Apertura fuera de ${hMin}:00–${hMax}:00`);
+    }
+    return { ...t, flags, alerta: flags.length > 0 || t.alerta };
+  });
+  return {
+    ...base,
+    horario: { aperturaMin: hMin, aperturaMax: hMax, horasMax: hMaxTurno },
+    filas,
+    conAlerta: filas.filter((x) => x.alerta).length,
+  };
+}
+
+export async function diagnostico(pool) {
+  const t0 = Date.now();
+  let dbOk = false, dbMs = null, err = null, nGoods = null;
+  try {
+    const t1 = Date.now();
+    await pool.query("SELECT 1");
+    dbMs = Date.now() - t1;
+    dbOk = true;
+    const [r] = await pool.query("SELECT COUNT(*) AS n FROM goods");
+    nGoods = num(r[0].n);
+  } catch (e) {
+    err = e.message || String(e);
+  }
+  return {
+    ok: dbOk,
+    servidorMs: Date.now() - t0,
+    dbMs,
+    error: err,
+    productos: nGoods,
+    version: "Admin POS unificado",
+    ts: new Date().toISOString(),
+  };
+}
+
+export async function busquedaGlobal(pool, ctx, q) {
+  const term = String(q.q || "").trim();
+  if (term.length < 2) return { tickets: [], productos: [], usuarios: [] };
+  const like = `%${term}%`;
+  const esNum = /^\d+$/.test(term);
+  const [tickets, productos, usuarios] = await Promise.all([
+    filas(
+      pool,
+      `SELECT DISTINCT o.Acct AS acct, ${F} AS fecha, u.Name AS cajero, SUM(${IMP}) AS total
+       FROM operations o LEFT JOIN users u ON u.ID = o.UserID
+       WHERE ${VENTA} AND ${RANGO} AND (${esNum ? "o.Acct = ?" : "0"} OR CAST(o.Acct AS CHAR) LIKE ?)
+       GROUP BY o.Acct, fecha, u.Name
+       ORDER BY fecha DESC LIMIT 15`,
+      esNum ? [ctx.r.desde, ctx.r.hasta, parseInt(term, 10), like] : [ctx.r.desde, ctx.r.hasta, like]
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, ${PRECIO} AS precio
+       FROM goods g WHERE COALESCE(g.Deleted,0)=0 AND (g.Name LIKE ? OR g.Code LIKE ?)
+       ORDER BY g.Name LIMIT 15`,
+      [like, like]
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT u.ID AS id, u.Name AS nombre FROM users u WHERE u.Name LIKE ? LIMIT 10`,
+      [like]
+    ).catch(() => []),
+  ]);
+  return {
+    tickets: tickets.map((x) => ({ acct: num(x.acct), ticket: numTicket(x.acct), fecha: x.fecha, cajero: x.cajero, total: num(x.total) })),
+    productos: productos.map((x) => ({ id: x.id, codigo: x.codigo, nombre: x.nombre, precio: num(x.precio) })),
+    usuarios: usuarios.map((x) => ({ id: x.id, nombre: x.nombre })),
+  };
 }

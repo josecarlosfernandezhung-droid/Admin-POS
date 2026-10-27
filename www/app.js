@@ -11,9 +11,21 @@ const SS = {
   set: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} },
   del: (k) => { try { sessionStorage.removeItem(k); } catch {} },
 };
-const S = { base: "", token: "", yo: null, periodo: "30", desde: "", hasta: "", vista: "resumen", estado: null, conteos: {}, tk: 0,
+const S = { base: "", token: "", yo: null, periodo: LS.get("periodoPref") || "hoy", desde: "", hasta: "", vista: "resumen", estado: null, conteos: {}, tk: 0,
   ventas: { q: "", pagina: 1, sub: "tickets" }, prod: { q: "", familia: "", orden: "vendidos", activos: true, pagina: 1, sub: "lista" }, exis: { q: "", local: "", pagina: 1 },
-  cajaPag: 1, invSub: "alertas", abcClase: "A", perSub: "auditoria", ev: { tipo: "cancel", usuario: "", nombre: "", pagina: 1 }, pagCb: null };
+  cajaPag: 1, invSub: "alertas", abcClase: "A", perSub: "auditoria", ev: { tipo: "cancel", usuario: "", nombre: "", pagina: 1 }, pagCb: null,
+  favs: (() => { try { return JSON.parse(LS.get("favs") || "[]"); } catch { return []; } })(),
+};
+function aplicarPrefs() {
+  document.documentElement.classList.toggle("oscuro", LS.get("tema") === "oscuro");
+  document.documentElement.classList.toggle("grande", LS.get("fuente") === "grande");
+}
+aplicarPrefs();
+function toggleFav(v) {
+  const i = S.favs.indexOf(v);
+  if (i >= 0) S.favs.splice(i, 1); else if (S.favs.length < 6) S.favs.push(v);
+  LS.set("favs", JSON.stringify(S.favs));
+}
 
 // Parámetros de periodo para las APIs (incluye rango personalizado)
 function paramsPeriodo(extra = {}) {
@@ -100,11 +112,14 @@ const centro = (html) => { $("#raiz").innerHTML = `<div class="centro"><div clas
 const logoCaja = `<img class="logo" src="logo.png" alt="">`;
 
 function pantallaServidor(msg) {
+  // (diagnóstico de red disponible tras conectar)
   centro(`${logoCaja}<h1>Admin POS</h1><p class="sub">Escribe la dirección de la PC de la tienda</p>
     <label class="campo">Dirección de la PC<input id="servidor" inputmode="url" placeholder="http://192.168.1.10:3000" value="${e(LS.get("servidor"))}"></label>
     <p class="error" id="err" ${msg ? "" : "hidden"}>${e(msg || "")}</p>
     <button class="btn" data-act="conectar">Conectar</button>
-    <p class="muted" style="text-align:center;font-size:.84rem;margin:0">La dirección aparece en la pantalla de inicio del programa en la PC.</p>`);
+    <button class="btn sec" data-act="probarDiag">Probar conexión</button>
+    <p id="diagRes" class="muted" style="text-align:center;font-size:.84rem;margin:0"></p>
+    <p class="muted" style="text-align:center;font-size:.84rem;margin:0">La PC debe tener Admin POS en bandeja (servidor activo). Mismo WiFi.</p>`);
 }
 async function conectarServidor() {
   let s = $("#servidor").value.trim().replace(/\/+$/, "");
@@ -115,6 +130,24 @@ async function conectarServidor() {
   try { await get("/api/estado"); LS.set("servidor", s); iniciar(); }
   catch (err) { pantallaServidor(err.message); }
 }
+// Probar sin entrar (diagnóstico de red)
+window.__probarDiag = async function () {
+  let s = $("#servidor")?.value.trim().replace(/\/+$/, "") || LS.get("servidor");
+  if (!s) { $("#diagRes").textContent = "Escribe la dirección primero"; return; }
+  if (!/^https?:\/\//i.test(s)) s = "http://" + s;
+  if (!/:\d+$/.test(s)) s += ":3000";
+  const prev = S.base; S.base = s;
+  try {
+    const t0 = Date.now();
+    const d = await get("/api/diagnostico");
+    const ms = Date.now() - t0;
+    $("#diagRes").textContent = d.ok
+      ? `✅ OK · ${ms} ms · BD ${d.dbMs} ms · ${fmt(d.productos,0)} productos`
+      : `❌ Servidor responde pero BD falla: ${d.error || ""}`;
+  } catch (err) {
+    $("#diagRes").textContent = "❌ No se pudo conectar: " + err.message;
+  } finally { S.base = prev; }
+};
 
 function pantallaDb(msg, previo = {}) {
   const est = S.estado;
@@ -223,6 +256,7 @@ async function iniciar(msg) {
   try { S.estado = await get("/api/estado"); }
   catch (err) { return esApp ? pantallaServidor(err.message) : centro(`${logoCaja}<h1>Admin POS</h1><p class="error" style="text-align:center">${e(err.message)}</p><button class="btn" data-act="reintentar">Reintentar</button>`); }
   const est = S.estado;
+  if (est.licencia && est.licencia.requiere) return pantallaLicencia(est.licencia);
   if (!est.dbConfigurada) return pantallaDb();
   if (est.dbError) return pantallaDbError();
   if (!est.pinsConfigurados) return pantallaPinInicial();
@@ -231,9 +265,64 @@ async function iniciar(msg) {
   pantallaLogin(msg);
 }
 
+function pantallaLicencia(lic = {}) {
+  const vencida = /vencid/i.test(lic.error || "");
+  const otraPc = /otra PC/i.test(lic.error || "");
+  const badge = vencida
+    ? '<span class="lic-badge lic-bad">Vencida</span>'
+    : otraPc
+      ? '<span class="lic-badge lic-bad">PC distinta</span>'
+      : '<span class="lic-badge lic-warn">Sin activar</span>';
+  const titulo = vencida ? "Licencia vencida" : otraPc ? "Licencia de otra PC" : "Activar licencia";
+  const ayuda = vencida
+    ? "Tu periodo terminó. Pide una renovación con el código de esta PC."
+    : otraPc
+      ? "Esa licencia fue emitida para otro equipo. Usa el código de abajo."
+      : "Para usar Admin POS en esta PC hace falta una licencia firmada.";
+  centro(`${logoCaja}
+    <div class="lic-head">
+      <h1>${titulo}</h1>
+      ${badge}
+    </div>
+    <p class="sub">${e(ayuda)}</p>
+    ${lic.error && !vencida && !otraPc ? `<div class="aviso-caja">${e(lic.error)}</div>` : ""}
+
+    <div class="lic-paso">
+      <div class="lic-n">1</div>
+      <div class="lic-paso-cuerpo">
+        <b>Código de esta PC</b>
+        <p class="muted" style="margin:4px 0 8px;font-size:.84rem">Envíaselo a quien te genera la licencia (WhatsApp, correo, etc.).</p>
+        <div class="lic-codigo">
+          <code id="mcLic">${e(lic.mc || "—")}</code>
+          <button type="button" class="btn sec chico" data-act="copiarMc">Copiar</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="lic-paso">
+      <div class="lic-n">2</div>
+      <div class="lic-paso-cuerpo">
+        <b>Pega la licencia recibida</b>
+        <p class="muted" style="margin:4px 0 8px;font-size:.84rem">Es un texto largo. Cópialo completo, sin espacios de más al inicio o al final.</p>
+        <textarea id="tokLic" class="lic-token" rows="5" placeholder="Pega aquí la licencia…" spellcheck="false" autocomplete="off"></textarea>
+>
+        <p class="error" id="errLic" hidden></p>
+        <p class="ok" id="okLic" hidden></p>
+      </div>
+    </div>
+
+    <button class="btn" id="btnActivarLic" data-act="activarLic">Activar licencia</button>
+    <button class="btn sec" data-act="reintentar">Ya la activé · reintentar</button>
+    <p class="muted" style="text-align:center;font-size:.8rem;margin:4px 0 0">La licencia queda guardada solo en esta PC y no necesita internet.</p>`);
+  const ta = $("#tokLic");
+  if (ta) {
+    ta.addEventListener("paste", () => setTimeout(() => { ta.value = ta.value.trim(); }, 0));
+  }
+}
+
 // ---------- Estructura principal ----------
-const SECCIONES = [["resumen", "Resumen"], ["ventas", "Ventas"], ["productos", "Productos"], ["existencias", "Existencias"], ["caja", "Caja"], ["equipo", "Equipo"], ["inventario", "Inventario"], ["perdidas", "Pérdidas"], ["ajustes", "Ajustes"]];
-const SIN_PERIODO = ["inventario", "ajustes"];
+const SECCIONES = [["resumen", "Resumen"], ["ventas", "Ventas"], ["productos", "Productos"], ["existencias", "Existencias"], ["caja", "Caja"], ["equipo", "Equipo"], ["inventario", "Inventario"], ["perdidas", "Pérdidas"], ["ajustes", "Ajustes"], ["ayuda", "Ayuda"]];
+const SIN_PERIODO = ["inventario", "ajustes", "ayuda"];
 let temporizadores = [];
 
 function entrarApp() {
@@ -248,7 +337,10 @@ function entrarApp() {
       <div class="pie"><div>${e(S.yo.nombre)} · ${ROL[S.yo.rol]}</div><button data-act="cambiarMiPin">Cambiar mi PIN</button><button data-act="salir">Salir</button></div></aside>
     <div class="principal"><div class="barra">
       <div class="marca"><img src="logo.png" alt=""><h2>Admin POS</h2><button class="yo" data-act="menuYo">${e(S.yo.nombre)}</button></div>
-      <div class="periodo" id="periodo">${[["7", "7 días"], ["30", "30 días"], ["90", "90 días"], ["todo", "Todo"], ["custom", "Fechas"]].map(([v, n]) => `<button data-act="periodo" data-v="${v}">${n}</button>`).join("")}
+      <div class="periodo" id="periodo">${[["hoy", "Hoy"], ["7", "7 días"], ["30", "30 días"], ["90", "90 días"], ["todo", "Todo"], ["custom", "Fechas"]].map(([v, n]) => `<button data-act="periodo" data-v="${v}">${n}</button>`).join("")}
+        <button class="btn sec chico" data-act="buscarGlobal" title="Buscar">🔍</button>
+        <button class="btn sec chico" data-act="toggleTema" id="btnTema" title="Cambiar tema claro/oscuro">${LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro"}</button>
+        <button class="btn sec chico" data-act="prefsUI" title="Preferencias">Aa</button>
         <span id="rango-custom" class="rango-custom" ${S.periodo === "custom" ? "" : "hidden"}>
           <input type="date" id="desde" value="${e(S.desde)}" data-in="fechaDesde">
           <span>–</span>
@@ -330,10 +422,10 @@ function graficaLinea(dias) {
     const pts = dias.map((d, i) => `${x(i).toFixed(1)},${y(d.total).toFixed(1)}`);
     const etq = [0, Math.floor((dias.length - 1) / 3), Math.floor(((dias.length - 1) * 2) / 3), dias.length - 1];
     return `<div class="linea"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
-      ${[0, 0.5, 1].map((f) => { const v = (max / 1.08) * f; return `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#e3dccf"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#6f685f">${compacto(v)}</text>`; }).join("")}
-      <path d="M${x(0)},${y(0)} L${pts.join(" L")} L${x(dias.length - 1)},${y(0)} Z" fill="#b8602f" opacity=".14"/>
-      <polyline points="${pts.join(" ")}" fill="none" stroke="#b8602f" stroke-width="2.4" stroke-linejoin="round"/>
-      ${etq.map((i) => `<text x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === dias.length - 1 ? "end" : "middle"}" font-size="11" fill="#6f685f">${diaCorto(dias[i].dia)}</text>`).join("")}</svg></div>`;
+      ${[0, 0.5, 1].map((f) => { const v = (max / 1.08) * f; return `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#d0dbe8"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#5a6b80">${compacto(v)}</text>`; }).join("")}
+      <path d="M${x(0)},${y(0)} L${pts.join(" L")} L${x(dias.length - 1)},${y(0)} Z" fill="#2563eb" opacity=".14"/>
+      <polyline points="${pts.join(" ")}" fill="none" stroke="#2563eb" stroke-width="2.4" stroke-linejoin="round"/>
+      ${etq.map((i) => `<text x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === dias.length - 1 ? "end" : "middle"}" font-size="11" fill="#5a6b80">${diaCorto(dias[i].dia)}</text>`).join("")}</svg></div>`;
   }
   return `<div class="chart-wrap"><canvas id="chart-dias" height="200"></canvas></div>`;
 }
@@ -345,10 +437,13 @@ function graficaDiaSemana(dias) {
 function montarCharts(d) {
   if (typeof Chart === "undefined") return;
   destruirCharts();
-  const color = "#b8602f";
-  const grid = "#e3dccf";
-  const txt = "#6f685f";
+  const color = "#2563eb";
+  const color2 = "#0ea5e9";
+  const color3 = "#7c3aed";
+  const grid = "#d0dbe8";
+  const txt = "#5a6b80";
   const tipFmt = (v) => cup(v);
+  const azules = ["#2563eb","#0ea5e9","#38bdf8","#1d4ed8","#0284c7","#7c3aed","#6366f1"];
 
   const cDias = document.getElementById("chart-dias");
   if (cDias && d.porDia && d.porDia.length > 1) {
@@ -356,7 +451,7 @@ function montarCharts(d) {
       type: "line",
       data: {
         labels: d.porDia.map((x) => diaCorto(x.dia)),
-        datasets: [{ label: "Ventas", data: d.porDia.map((x) => x.total), borderColor: color, backgroundColor: "rgba(184,96,47,.15)", fill: true, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 }],
+        datasets: [{ label: "Ventas", data: d.porDia.map((x) => x.total), borderColor: color, backgroundColor: "rgba(37,99,235,.18)", fill: true, tension: 0.25, pointRadius: 3, pointHoverRadius: 6, pointBackgroundColor: color, pointBorderColor: "#fff" }],
       },
       options: {
         responsive: true, maintainAspectRatio: false,
@@ -375,7 +470,7 @@ function montarCharts(d) {
     for (let i = a; i <= b; i++) { labels.push(i + ":00"); vals.push(mapa.get(i) || 0); }
     chartsActivos.horas = new Chart(cHoras, {
       type: "bar",
-      data: { labels, datasets: [{ label: "Ventas", data: vals, backgroundColor: color, borderRadius: 4 }] },
+      data: { labels, datasets: [{ label: "Ventas", data: vals, backgroundColor: vals.map((_, i) => azules[i % azules.length]), borderRadius: 6 }] },
       options: {
         responsive: true, maintainAspectRatio: false,
         plugins: { legend: { display: false }, tooltip: { callbacks: { label: (ctx) => tipFmt(ctx.raw) } } },
@@ -400,7 +495,7 @@ function montarCharts(d) {
     const vals = orden.map((i) => (cnt[i] ? acum[i] / cnt[i] : 0));
     chartsActivos.diasem = new Chart(cSem, {
       type: "bar",
-      data: { labels, datasets: [{ label: "Promedio por día", data: vals, backgroundColor: color, borderRadius: 4 }] },
+      data: { labels, datasets: [{ label: "Promedio por día", data: vals, backgroundColor: vals.map((_, i) => azules[i % azules.length]), borderRadius: 6 }] },
       options: {
         responsive: true, maintainAspectRatio: false,
         plugins: { legend: { display: false }, tooltip: { callbacks: { label: (ctx) => "Promedio: " + tipFmt(ctx.raw) } } },
@@ -415,14 +510,42 @@ const vistas = {};
 
 vistas.resumen = async (silencio) => {
   const tk = S.tk;
-  const d = await get("/api/resumen", paramsPeriodo());
+  const [d, panel, alertas] = await Promise.all([
+    get("/api/resumen", paramsPeriodo()),
+    get("/api/panel", paramsPeriodo()).catch(() => null),
+    get("/api/alertas-inicio", paramsPeriodo()).catch(() => null),
+  ]);
   if (!aqui(tk)) return;
   const solo = S.yo.rol === "cajero";
   const pico = d.porHora.reduce((m, x) => (!m || x.total > m.total ? x : m), null);
   const tr = d.tiempoReal;
   const vc = (v, txt) => (v == null ? `<div class="v muted">${txt}</div>` : `<div class="v ${claseVar(v)}">${v >= 0 ? "▲" : "▼"} ${signo(v)} ${txt}</div>`);
   const maxFam = Math.max(1, ...d.familias.map((f) => f.total));
+  const bloqAlertas = alertas?.items?.length
+    ? `<div class="tarjeta"><h3>Alertas al abrir</h3>${alertas.items.map((a) => `<div class="fila"><span class="etiqueta et-${a.nivel === "ok" ? "ok" : a.nivel === "alta" ? "alta" : "media"}">${a.nivel}</span><span style="margin-left:8px">${e(a.texto)}</span></div>`).join("")}</div>`
+    : "";
+  const bloqPanel = panel && !solo
+    ? `<div class="kpis">
+        <div class="kpi"><span>Ventas (período)</span><b class="num">${cup(panel.ventasPeriodo)}</b><small>${fmt(panel.tickets, 0)} tickets</small></div>
+        <div class="kpi"><span>Último día</span><b class="num">${cup(panel.ventasHoy)}</b></div>
+        <div class="kpi"><span>Caja fuera tol.</span><b class="num">${fmt(panel.caja?.conDiferencia || 0, 0)}</b><small>falt. ${cup(panel.caja?.faltante || 0)}</small></div>
+        <div class="kpi"><span>Mermas</span><b class="num">${cup(panel.mermas || 0)}</b></div>
+      </div>
+      ${(panel.stockCritico || []).length ? `<div class="tarjeta"><h3>Stock crítico</h3>${panel.stockCritico.map((x) => `<div class="fila"><div>${e(x.nombre)}</div><div class="d"><span class="etiqueta et-alta">${e(x.tipo || "alerta")}</span></div></div>`).join("")}</div>` : ""}`
+    : "";
+  // Notificaciones locales (app abierta)
+  if (alertas?.items?.some((a) => a.nivel === "alta") && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    try { new Notification("Admin POS", { body: alertas.items.filter((a) => a.nivel === "alta").map((a) => a.texto).join(" · ") }); } catch {}
+  } else if (alertas?.items?.some((a) => a.nivel === "alta") && typeof Notification !== "undefined" && Notification.permission === "default") {
+    try { Notification.requestPermission(); } catch {}
+  }
+  const favHtml = S.favs.length
+    ? `<div class="favs">${S.favs.map((v) => `<button data-act="irFav" data-v="${e(v)}">${e(v)}</button>`).join("")}
+        <button class="link" data-act="comparar">Comparar períodos</button></div>`
+    : `<div class="favs"><button class="link" data-act="comparar">Comparar períodos</button>
+        <span class="muted" style="font-size:.82rem">Marca secciones como favoritas desde el menú (próximamente) o úsalas abajo.</span></div>`;
   $("#contenido").innerHTML = `${cab(solo ? "Tus ventas" : "Cómo va la tienda", `${rangoTxt(d)}. Importes de las ventas registradas en AxisPOS, en CUP.`)}
+    ${favHtml}${bloqAlertas}${bloqPanel}
     <div class="tarjeta hero"><div class="etq">${solo ? "Tus ventas del período" : "Ventas del período"}</div>
       <div class="grande num">${cup(d.total)}</div>
       <div class="muted">Neto ${cup(d.neto)} tras devoluciones · unos ${fmt(d.neto / d.tasa, 0)} US$ a ${fmt(d.tasa, 0)} CUP</div>
@@ -514,7 +637,30 @@ async function abrirTicket(acct) {
 
 vistas.productos = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["lista", "Catálogo"], ["top", "Top productos"]], S.prod.sub, "prodSub");
+  const tabs = subTabs([["lista", "Catálogo"], ["top", "Top"], ["precios", "Precios"], ["margen", "Margen"], ["efecto", "Efecto precio"]], S.prod.sub, "prodSub");
+  if (S.prod.sub === "margen") {
+    const d = await get("/api/margen", paramsPeriodo());
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Productos", "Margen bruto por producto y familia (costo real o estimado).")}${tabs}
+      <div class="tarjeta"><h3>Por familia</h3><div class="scroll"><table><tr><th>Familia</th><th class="d">Ventas</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">Margen</th></tr>
+      ${d.familias.map((f) => `<tr><td>${e(f.familia)}</td><td class="d num">${cup(f.ventas)}</td><td class="d num">${cup(f.costo)}</td><td class="d num">${cup(f.ganancia)}</td><td class="d num">${fmt(f.margen * 100, 1)} %</td></tr>`).join("")}
+      </table></div></div>
+      <div class="tarjeta"><h3>Por producto</h3><div class="scroll"><table><tr><th>Producto</th><th class="d">Unid.</th><th class="d">Ventas</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">Margen</th></tr>
+      ${d.filas.map((x) => `<tr><td>${e(x.nombre)}${x.estimado ? " <small>(est.)</small>" : ""}</td><td class="d num">${fmt(x.unidades, 0)}</td><td class="d num">${cup(x.ventas)}</td><td class="d num">${cup(x.costo)}</td><td class="d num">${cup(x.ganancia)}</td><td class="d num">${fmt(x.margen * 100, 1)} %</td></tr>`).join("")}
+      </table></div></div>`;
+    return;
+  }
+  if (S.prod.sub === "efecto") {
+    const d = await get("/api/efecto-precios", paramsPeriodo());
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Productos", "Productos cuyo precio medio cambió entre la 1.ª y 2.ª mitad del período.")}${tabs}
+      <div class="tarjeta"><div class="scroll"><table><tr><th>Producto</th><th class="d">P. antes</th><th class="d">P. después</th><th class="d">Δ %</th><th class="d">Unid. antes</th><th class="d">Unid. después</th><th class="d">Δ unid.</th></tr>
+      ${d.filas.map((x) => `<tr><td>${e(x.nombre)}</td><td class="d num">${cup(x.precioAntes)}</td><td class="d num">${cup(x.precioDespues)}</td>
+        <td class="d num">${fmt(x.cambioPct * 100, 1)} %</td><td class="d num">${fmt(x.unidAntes, 0)}</td><td class="d num">${fmt(x.unidDespues, 0)}</td>
+        <td class="d num">${x.varUnid != null ? fmt(x.varUnid * 100, 0) + " %" : "—"}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">Sin cambios de precio significativos</td></tr>'}
+      </table></div></div>`;
+    return;
+  }
   if (S.prod.sub === "top") {
     const d = await get("/api/top", paramsPeriodo({ limite: 50 }));
     if (!aqui(tk)) return;
@@ -523,6 +669,30 @@ vistas.productos = async () => {
       <div class="tarjeta"><div class="scroll"><table><tr><th>#</th><th>Artículo</th><th>Familia</th><th class="d">Unid.</th><th class="d">Tickets</th><th class="d">%</th><th class="d">Total</th></tr>
       ${d.filas.map((p) => `<tr class="clic" data-act="prodTx" data-id="${p.id}" style="cursor:pointer"><td class="num muted">${p.puesto}</td><td>${e(p.nombre)}<small>${e(p.codigo || "")}</small></td><td class="muted">${e(p.familia)}</td><td class="d num">${fmt(p.unidades, 0)}</td><td class="d num">${fmt(p.tickets, 0)}</td><td class="d num">${fmt(p.parte * 100, 1)} %</td><td class="d num"><b>${cup(p.total)}</b></td></tr>`).join("") || '<tr><td colspan="7" class="muted">Sin ventas</td></tr>'}
       </table></div></div>`;
+    return;
+  }
+  if (S.prod.sub === "precios") {
+    const d = await get("/api/cambios-precio", paramsPeriodo());
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Productos", "Artículos vendidos a más de un precio en el período y quién los cobró así.")}${tabs}
+      <div class="kpis"><div class="kpi"><span>Productos con varios precios</span><b class="num">${fmt(d.total, 0)}</b></div></div>
+      <div class="tarjeta"><p class="muted" style="margin:0 0 10px;font-size:.86rem">Se detecta por el precio de cada línea de venta en AxisPOS (no hay un log de «quién editó la ficha»). Si el mismo producto se vendió a 2+ precios distintos, aquí ves a qué precio, cuántas veces y qué cajero lo cobró.</p>
+      ${d.filas.map((p) => `<div class="tarjeta" style="margin:0 0 12px;box-shadow:none;border:1px solid var(--borde)">
+        <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+          <div><b>${e(p.nombre)}</b><small style="display:block">${e(p.familia)}${p.codigo ? " · " + e(p.codigo) : ""}</small></div>
+          <div class="d num"><span class="etiqueta et-media">${p.nPrecios} precios</span>
+            <small style="display:block">de ${cup(p.precioMin)} a ${cup(p.precioMax)} (Δ ${cup(p.variacion)})</small></div>
+        </div>
+        <div class="scroll" style="margin-top:8px"><table><tr><th class="d">Precio</th><th class="d">Unid.</th><th class="d">Tickets</th><th>Quién cobró a ese precio</th></tr>
+        ${p.precios.map((pr) => `<tr>
+          <td class="d num"><b>${cup(pr.precio)}</b></td>
+          <td class="d num">${fmt(pr.unidades, 0)}</td>
+          <td class="d num">${fmt(pr.tickets, 0)}</td>
+          <td>${(pr.quienes || []).map((q) => `${e(q.usuario)} (${fmt(q.tickets, 0)} t.)`).join(", ") || "—"}</td>
+        </tr>`).join("")}
+        </table></div>
+      </div>`).join("") || '<p class="muted">En este período ningún producto se vendió a más de un precio distinto.</p>'}
+      </div>`;
     return;
   }
   const d0 = await get("/api/productos", paramsPeriodo({ q: S.prod.q, familia: S.prod.familia, orden: S.prod.orden, activos: S.prod.activos ? 1 : 0, pagina: S.prod.pagina }));
@@ -583,36 +753,97 @@ vistas.caja = async () => {
   const d = await get("/api/caja", paramsPeriodo({ pagina: S.cajaPag }));
   if (!aqui(tk)) return;
   S.pagCb = (n) => { S.cajaPag = n; vista(true); };
-  const etDif = (t) => (t.diferencia == null ? '<span class="etiqueta et-gris">Sin cierre</span>' : `<span class="etiqueta et-${t.nivel === "alta" ? "alta" : t.nivel === "media" ? "media" : "ok"}">${t.diferencia > 0 ? "+" : ""}${fmt(t.diferencia, 0)}</span>`);
-  $("#contenido").innerHTML = `${cab("Caja", "Conciliación de cada turno: lo que el sistema vendió contra lo que se contó al cerrar.")}
+  const etDif = (t) => {
+    if (t.diferencia == null) return '<span class="etiqueta et-gris">Sin cierre</span>';
+    const txt = `${t.diferencia > 0 ? "+" : ""}${fmt(t.diferencia, 0)}`;
+    if (t.nivel === "ok") return `<span class="etiqueta et-ok">OK ${txt}</span>`;
+    return `<span class="etiqueta et-${t.nivel === "alta" ? "alta" : "media"}">${txt}</span>`;
+  };
+  const etPagos = (t) => {
+    if (!(t.ventas > 0)) return "—";
+    if (Math.abs(t.difPagos) <= 1) return '<span class="muted" style="font-size:.82rem">Pagos OK</span>';
+    return `<span class="etiqueta et-media">Δ ${fmt(t.difPagos, 0)}</span>`;
+  };
+  $("#contenido").innerHTML = `${cab("Caja", "Conciliación de cada turno: lo contado al cierre vs lo que el sistema esperaba.")}
     <div class="kpis"><div class="kpi"><span>Ventas</span><b class="num">${cup(d.ventas)}</b></div><div class="kpi"><span>Devoluciones</span><b class="num">${cup(d.devoluciones)}</b></div><div class="kpi"><span>Neto</span><b class="num">${cup(d.neto)}</b></div>
-      <div class="kpi"><span>Turnos</span><b class="num">${d.turnos}</b><small>${d.conDiferencia} con diferencia mayor a ${fmt(d.tolerancia, 0)} CUP</small></div></div>
-    ${d.conDiferencia ? `<div class="tarjeta"><h3>Auditoría de cierres</h3><div class="rt"><div><span>Faltante acumulado</span><b class="num" style="color:var(--rojo)">${cup(d.faltante)}</b></div><div><span>Sobrante acumulado</span><b class="num" style="color:var(--verde)">${cup(d.sobrante)}</b></div><div><span>Turnos sin cuadrar con cobros</span><b class="num">${d.sinCuadrar}</b></div></div>
-      <details style="margin-top:10px"><summary class="muted" style="cursor:pointer;font-size:.86rem">¿Por qué puede haber diferencias grandes?</summary>
-      <p class="muted" style="margin:8px 0 0;font-size:.86rem">
-        <b>Esperado</b> = fondo inicial + ventas del turno − devoluciones − retiros.<br>
-        <b>Diferencia</b> = dinero contado al cierre − esperado (negativo = faltante, positivo = sobrante).<br>
-        Diferencias grandes suelen deberse a: fondo inicial mal registrado, retiros no apuntados, ventas de otro turno contadas aquí, o contado de caja que incluye otras formas de pago. El histórico por cajero (abajo) ayuda a ver si se concentra en alguien. «Sin cuadrar con cobros» compara ventas del sistema vs pagos registrados (efectivo/tarjeta/transferencia).
-      </p></details></div>` : ""}
-    ${(d.porCajero && d.porCajero.length) ? `<div class="tarjeta"><h3>Histórico de diferencias por cajero</h3>
-      <p class="muted" style="margin:-4px 0 10px;font-size:.86rem">Cruce automático entre el dinero contado al cierre y las ventas teóricas del turno (efectivo + tarjetas + transferencias). Útil para auditorías internas.</p>
-      <div class="scroll"><table><tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Con dif.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto</th><th class="d">Máx. faltante</th></tr>
+      <div class="kpi"><span>Turnos</span><b class="num">${d.turnos}</b><small>${d.conDiferencia} fuera de tolerancia (${fmt(d.tolerancia, 0)} CUP)</small></div></div>
+    <div class="tarjeta"><h3>Cómo leer las columnas</h3>
+      <p class="muted" style="margin:0;font-size:.86rem">
+        <b>Esperado</b> = fondo inicial + ventas − devoluciones − retiros.<br>
+        <b>Diferencia (efectivo)</b> = contado − esperado. Negativo = faltante, positivo = sobrante. Solo es <b>OK</b> si |diferencia| ≤ tolerancia (${fmt(d.tolerancia, 0)} CUP en Ajustes).<br>
+        <b>Pagos vs ventas</b> es otra cosa: compara el total de ventas del turno con los pagos registrados (efectivo/tarjeta/transferencia). «Pagos OK» no significa que el efectivo del cajón cuadre.
+      </p></div>
+    ${d.conDiferencia ? `<div class="tarjeta"><h3>Auditoría de cierres (efectivo)</h3><div class="rt"><div><span>Faltante acumulado</span><b class="num" style="color:var(--rojo)">${cup(d.faltante)}</b></div><div><span>Sobrante acumulado</span><b class="num" style="color:var(--verde)">${cup(d.sobrante)}</b></div><div><span>Turnos con pagos ≠ ventas</span><b class="num">${d.sinCuadrar}</b></div></div></div>` : ""}
+    ${(d.porCajero && d.porCajero.length) ? `<div class="tarjeta"><h3>Histórico de diferencias por cajero (efectivo)</h3>
+      <div class="scroll"><table><tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Fuera tol.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto</th><th class="d">Máx. faltante</th></tr>
       ${d.porCajero.map((c) => `<tr><td>${e(c.usuario)}</td><td class="d num">${c.turnos}</td><td class="d num">${c.conDif}</td>
         <td class="d num" style="color:${c.faltante < 0 ? "var(--rojo)" : "inherit"}">${c.faltante ? cup(c.faltante) : "—"}</td>
         <td class="d num" style="color:${c.sobrante > 0 ? "var(--verde)" : "inherit"}">${c.sobrante ? cup(c.sobrante) : "—"}</td>
         <td class="d num">${cup(c.totalDif)}</td>
         <td class="d num">${c.maxFaltante < 0 ? cup(c.maxFaltante) : "—"}</td></tr>`).join("")}</table></div></div>` : ""}
     <div class="tarjeta"><h3>Cobros por forma de pago</h3>${d.formasPago.map((f) => `<div class="fila"><div>${e(f.socio)}<small>${fmt(f.tickets, 0)} tickets</small></div><div class="d num">${cup(f.total)}</div></div>`).join("") || '<p class="muted">Sin datos</p>'}</div>
-    <div class="tarjeta"><h3>Turnos</h3><p class="muted" style="margin:-4px 0 10px;font-size:.86rem">Esperado = fondo inicial + ventas − devoluciones − retiros. Diferencia = contado − esperado (negativo = faltante). «Cobros» compara las ventas con los pagos registrados.</p>
-      <div class="scroll"><table><tr><th>Apertura</th><th>Cierre</th><th>Quién abrió</th><th class="d">Ventas</th><th class="d">Contado</th><th class="d">Diferencia</th><th class="d">Cobros</th></tr>
-      ${d.filas.map((t) => `<tr><td class="num">${fechaHora(t.apertura)}</td><td class="num">${fechaHora(t.cierre)}</td><td>${e(t.usuario || "")}</td><td class="d num">${cup(t.ventas)}</td><td class="d num">${t.contado ? cup(t.contado) : "—"}</td><td class="d">${etDif(t)}</td><td class="d">${t.ventas > 0 ? (Math.abs(t.difPagos) <= 1 ? '<span class="etiqueta et-ok">Cuadra</span>' : `<span class="etiqueta et-media">${fmt(t.difPagos, 0)}</span>`) : "—"}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">Sin turnos en el período</td></tr>'}</table></div>${pager(d.pagina, d.paginas)}</div>`;
+    <div class="tarjeta"><h3>Turnos</h3>
+      <div class="scroll"><table><tr><th>Apertura</th><th>Quién</th><th class="d">Ventas</th><th class="d">Efectivo</th><th class="d">Tarjeta</th><th class="d">Transfer.</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Dif. efectivo</th><th class="d">Horas</th></tr>
+      ${d.filas.map((t) => `<tr>
+        <td class="num">${fechaHora(t.apertura)}<small>${fechaHora(t.cierre)}</small></td>
+        <td>${e(t.usuario || "")}<small>${e(t.local || "")}</small></td>
+        <td class="d num">${cup(t.ventas)}</td>
+        <td class="d num">${t.efectivo ? cup(t.efectivo) : "—"}</td>
+        <td class="d num">${t.tarjeta ? cup(t.tarjeta) : "—"}</td>
+        <td class="d num">${t.transferencia ? cup(t.transferencia) : "—"}</td>
+        <td class="d num">${t.contado ? cup(t.esperado) : "—"}</td>
+        <td class="d num">${t.contado ? cup(t.contado) : "—"}</td>
+        <td class="d">${etDif(t)}</td>
+        <td class="d num">${t.horasTurno != null ? fmt(t.horasTurno, 1) + " h" : "—"}</td>
+      </tr>`).join("") || '<tr><td colspan="10" class="muted">Sin turnos en el período</td></tr>'}</table></div>${pager(d.pagina, d.paginas)}</div>`;
 };
 
 vistas.equipo = async () => {
   const tk = S.tk;
+  if (!S.eqSub) S.eqSub = "ventas";
+  const tabs = subTabs([["ventas", "Ventas"], ["prod", "Productividad"], ["ranking", "Ranking + señales"], ["turnos", "Horario turnos"]], S.eqSub, "eqSub");
+  if (S.eqSub === "ranking") {
+    const d = await get("/api/ranking", paramsPeriodo());
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Equipo", "Productividad y señales de caja/anulaciones.")}${tabs}
+      <div class="tarjeta"><div class="scroll"><table><tr><th>Cajero</th><th class="d">Ventas/h</th><th class="d">Tickets/h</th><th>Señales</th></tr>
+      ${d.filas.map((x) => `<tr><td>${e(x.usuario)}</td><td class="d num">${x.ventasHora!=null?cup(x.ventasHora):"—"}</td>
+        <td class="d num">${x.ticketsHora!=null?fmt(x.ticketsHora,1):"—"}</td>
+        <td>${(x.señales||[]).map((s)=>`<span class="etiqueta et-${s.nivel}">${e(s.texto)}</span> `).join("")||'<span class="etiqueta et-ok">OK</span>'}</td></tr>`).join("")}
+      </table></div></div>`;
+    return;
+  }
+  if (S.eqSub === "prod") {
+    const d = await get("/api/productividad", paramsPeriodo());
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Equipo", "Tickets y ventas por hora de turno.")}${tabs}
+      <div class="tarjeta"><div class="scroll"><table><tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Horas</th><th class="d">Tickets/h</th><th class="d">Ventas/h</th><th class="d">Unid/ticket</th><th class="d">Ticket medio</th></tr>
+      ${d.filas.map((x) => `<tr><td>${e(x.usuario)}</td><td class="d num">${x.turnos}</td><td class="d num">${fmt(x.horas, 1)}</td>
+        <td class="d num">${x.ticketsHora != null ? fmt(x.ticketsHora, 1) : "—"}</td>
+        <td class="d num">${x.ventasHora != null ? cup(x.ventasHora) : "—"}</td>
+        <td class="d num">${x.unidTicket != null ? fmt(x.unidTicket, 1) : "—"}</td>
+        <td class="d num">${x.ticketMedio != null ? cup(x.ticketMedio) : "—"}</td></tr>`).join("")}
+      </table></div></div>`;
+    return;
+  }
+  if (S.eqSub === "turnos") {
+    const d = await get("/api/turnos-horario", paramsPeriodo());
+    if (!aqui(tk)) return;
+    const h = d.horario || {};
+    $("#contenido").innerHTML = `${cab("Equipo", `Horario esperado apertura ${h.aperturaMin}:00–${h.aperturaMax}:00 · máx ${h.horasMax} h (Ajustes).`)}${tabs}
+      <div class="kpis"><div class="kpi"><span>Abiertos</span><b class="num">${fmt(d.abiertos, 0)}</b></div><div class="kpi"><span>Con alerta</span><b class="num">${fmt(d.conAlerta, 0)}</b></div></div>
+      <div class="tarjeta"><div class="scroll"><table><tr><th>Apertura</th><th>Cierre</th><th>Quién</th><th>Local</th><th class="d">Horas</th><th>Alertas</th></tr>
+      ${d.filas.map((x) => `<tr ${x.alerta ? 'style="background:rgba(255,80,80,.08)"' : ""}>
+        <td class="num">${fechaHora(x.apertura)}</td><td class="num">${x.cierre ? fechaHora(x.cierre) : "Abierto"}</td>
+        <td>${e(x.usuario || "")}</td><td class="muted">${e(x.local || "")}</td>
+        <td class="d num">${x.horas != null ? fmt(x.horas, 1) : "—"}</td>
+        <td>${(x.flags||[]).map((f)=>`<span class="etiqueta et-media">${e(f)}</span>`).join(" ")||"—"}</td></tr>`).join("")}
+      </table></div></div>`;
+    return;
+  }
   const d = await get("/api/equipo", paramsPeriodo());
   if (!aqui(tk)) return;
-  $("#contenido").innerHTML = `${cab("Equipo", "Quién cobró y a nombre de qué socio quedó la venta.")}
+  $("#contenido").innerHTML = `${cab("Equipo", "Quién cobró y a nombre de qué socio quedó la venta.")}${tabs}
     ${d.cajeros.map((c) => `<div class="tarjeta"><div style="display:flex;justify-content:space-between;align-items:baseline"><h3 style="margin:0">${e(c.nombre)}</h3>${etRol(c.rol)}</div><span class="muted">${e(c.grupo)}</span>
       <div class="grande num" style="font:600 1.7rem var(--serif);margin:8px 0 2px">${cup(c.total)}</div><div class="muted">${fmt(c.tickets, 0)} tickets · devoluciones ${cup(c.devoluciones)} · promedio ${compacto(c.tickets ? c.total / c.tickets : 0)}</div>
       <div class="hbar"><div class="pista"><i style="width:${Math.max(2, c.parte * 100)}%"></i></div></div></div>`).join("") || '<div class="tarjeta"><p class="muted">Sin ventas en este período</p></div>'}
@@ -629,6 +860,9 @@ vistas.inventario = async () => {
     ["alertas", "Alertas"],
     ["ipv", "IPV"],
     ["traspasos", "Traspasos"],
+    ["hechos", "Traspasos hechos"],
+    ["antiguedad", "Antigüedad"],
+    ["fisico", "Físico / Arqueo"],
     ["abc", "ABC"],
     ["compras", "Compras"],
   ], S.invSub, "invSub");
@@ -656,7 +890,8 @@ vistas.inventario = async () => {
       </div>
       <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Buscar producto" value="${e(S.exis.q)}" data-in="buscaExis">
         <select data-in="localExis"><option value="">Todos los locales</option>${d.locales.map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.local) ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}</select>
-        <button class="btn sec" data-act="invSub" data-v="ipv">Aplicar</button></div>
+        <button class="btn sec" data-act="invSub" data-v="ipv">Aplicar</button>
+        <button class="btn sec" data-act="printVista">Imprimir / PDF</button></div>
         <p class="muted" style="margin:0 0 8px;font-size:.84rem">Período ${diaLargo(d.desde)} – ${diaLargo(d.hasta)}. Inicial = stock actual − movimientos del período (reconstruido desde AxisPOS).</p>
         <h3>Movimiento de mercancías por producto</h3>
         <div class="scroll"><table>
@@ -683,30 +918,74 @@ vistas.inventario = async () => {
   } else if (S.invSub === "traspasos") {
     const d = await get("/api/traspasos", paramsPeriodo());
     if (!aqui(tk)) return;
+    const inv = d.inversion || { total: 0, porLocal: [] };
     cuerpo = `<div class="kpis">
+        <div class="kpi"><span>Inversión total</span><b class="num">${cup(inv.total)}</b><small>costo real o −${d.costoEstimadoPct || 0} % del precio</small></div>
         <div class="kpi"><span>Productos a mover</span><b class="num">${fmt(d.resumen.productos, 0)}</b><small>${d.resumen.altas} urgencia alta</small></div>
         <div class="kpi"><span>Unidades sugeridas</span><b class="num">${fmt(d.resumen.unidades, 0)}</b></div>
-        <div class="kpi"><span>Valor a costo</span><b class="num">${cup(d.resumen.valorCosto)}</b></div>
-        <div class="kpi"><span>Cobertura objetivo</span><b class="num">${d.diasObjetivo} días</b><small>según ventas ${d.dias} d</small></div>
+        <div class="kpi"><span>Valor del traspaso</span><b class="num">${cup(d.resumen.valorCosto)}</b></div>
       </div>
-      <div class="tarjeta"><h3>Cómo se calcula</h3>
+      <div class="tarjeta"><h3>Inversión por almacén / local</h3>
+        <div class="scroll"><table><tr><th>Local</th><th>Tipo</th><th class="d">Refs.</th><th class="d">Piezas</th><th class="d">Invertido</th></tr>
+        ${inv.porLocal.map((x) => `<tr><td>${e(x.local)}</td><td class="muted">${e(x.tipo)}</td><td class="d num">${fmt(x.refs, 0)}</td><td class="d num">${fmt(x.piezas, 1)}</td><td class="d num"><b>${cup(x.inversion)}</b></td></tr>`).join("") || '<tr><td colspan="5" class="muted">Sin stock</td></tr>'}
+        </table></div></div>
+      <div class="tarjeta"><h3>Cómo se calcula el traspaso</h3>
         <p class="muted" style="margin:0;font-size:.86rem">
-          <b>Punto de venta:</b> ${d.puntosVenta.map((x) => e(x.nombre)).join(", ") || "—"} (locales con ventas en el período).<br>
-          <b>Almacén:</b> ${d.almacenes.map((x) => e(x.nombre)).join(", ") || "—"} (locales con stock y poca o ninguna venta).<br>
-          Se sugiere traspasar lo necesario para cubrir <b>${d.diasObjetivo} días</b> de venta en el punto de venta, sin pasar de lo que hay en almacén.
+          <b>PV:</b> ${d.puntosVenta.map((x) => e(x.nombre)).join(", ") || "—"} · <b>Almacén:</b> ${d.almacenes.map((x) => e(x.nombre)).join(", ") || "—"}.<br>
+          Objetivo = mayor entre <b>mínimo de ficha</b> y <b>nominal</b> (${d.diasObjetivo} días × venta diaria). Se mueve la diferencia, sin superar el stock del almacén.
         </p></div>
-      <div class="tarjeta"><h3>Sugerencias de traspaso almacén → punto de venta</h3>
-        <div class="scroll"><table><tr><th>Producto</th><th class="d">Venta/día</th><th class="d">En PV</th><th class="d">En almacén</th><th class="d">Cubre</th><th class="d">Mover</th><th>Urgencia</th></tr>
+      <div class="tarjeta"><h3>Sugerencias almacén → punto de venta</h3>
+        <div class="scroll"><table><tr><th>Producto</th><th class="d">Mín.</th><th class="d">Nominal</th><th class="d">En PV</th><th class="d">En alm.</th><th class="d">Mover</th><th>Urgencia</th></tr>
         ${d.filas.map((x) => `<tr>
-          <td>${e(x.nombre)}<small>${e(x.familia)} · de ${e(x.desde)} → ${e(x.hacia)}</small></td>
-          <td class="d num">${fmt(x.diaria, 1)}</td>
+          <td>${e(x.nombre)}<small>${e(x.motivo || "")} · ${e(x.desde)} → ${e(x.hacia)}</small></td>
+          <td class="d num">${x.minimo ? fmt(x.minimo, 1) : "—"}</td>
+          <td class="d num">${fmt(x.nominal, 1)}</td>
           <td class="d num">${fmt(x.enPv, 1)}</td>
           <td class="d num">${fmt(x.enAlm, 1)}</td>
-          <td class="d num">${fmt(x.coberturaPv, 1)} d</td>
           <td class="d num"><b>${fmt(x.sugerido, 1)}</b></td>
           <td><span class="etiqueta et-${x.urgencia === "alta" ? "alta" : x.urgencia === "media" ? "media" : "ok"}">${x.urgencia}</span></td>
-        </tr>`).join("") || '<tr><td colspan="7" class="muted">Nada urgente que mover: el punto de venta tiene cobertura suficiente o no hay stock en almacén.</td></tr>'}
+        </tr>`).join("") || '<tr><td colspan="7" class="muted">Nada que mover: el PV cumple mínimo y cobertura, o no hay stock en almacén.</td></tr>'}
         </table></div></div>`;
+  } else if (S.invSub === "hechos") {
+    const d = await get("/api/traspasos-hechos", paramsPeriodo());
+    cuerpo = `<div class="kpis"><div class="kpi"><span>Movimientos</span><b class="num">${fmt(d.movimientos, 0)}</b></div><div class="kpi"><span>Unidades</span><b class="num">${fmt(d.unidades, 0)}</b></div></div>
+      <div class="tarjeta"><h3>Historial de traspasos (AxisPOS)</h3>
+        <div class="scroll"><table><tr><th>Cuándo</th><th>Tipo</th><th>Producto</th><th class="d">Cant.</th><th>Usuario</th><th>Local</th></tr>
+        ${d.filas.map((x) => `<tr><td class="num">${fechaHora(x.fecha)}</td><td>${e(x.nombreTipo)}</td><td>${e(x.nombre)}</td><td class="d num">${fmt(x.cant, 1)}</td><td>${e(x.usuario || "")}</td><td class="muted">${e(x.local)}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Sin traspasos registrados en el período (OperType 7/26/27).</td></tr>'}
+        </table></div></div>`;
+  } else if (S.invSub === "antiguedad") {
+    const d = await get("/api/antiguedad", paramsPeriodo());
+    const r = d.resumen;
+    cuerpo = `<div class="kpis">
+        <div class="kpi"><span>0–30 días</span><b class="num">${fmt(r.d0_30.n, 0)}</b><small>${cup(r.d0_30.capital)}</small></div>
+        <div class="kpi"><span>31–60</span><b class="num">${fmt(r.d31_60.n, 0)}</b><small>${cup(r.d31_60.capital)}</small></div>
+        <div class="kpi"><span>61–90</span><b class="num">${fmt(r.d61_90.n, 0)}</b><small>${cup(r.d61_90.capital)}</small></div>
+        <div class="kpi"><span>&gt;90 días</span><b class="num">${fmt(r.d90.n, 0)}</b><small>${cup(r.d90.capital)}</small></div>
+        <div class="kpi"><span>Nunca vendido</span><b class="num">${fmt(r.nunca.n, 0)}</b><small>${cup(r.nunca.capital)}</small></div>
+      </div>
+      <div class="tarjeta"><h3>Capital parado &gt; 90 días</h3>
+        <div class="scroll"><table><tr><th>Producto</th><th>Familia</th><th class="d">Stock</th><th class="d">Días</th><th class="d">Valor</th></tr>
+        ${d.filas90.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.familia)}</td><td class="d num">${fmt(x.stock, 1)}</td><td class="d num">${x.dias ?? "—"}</td><td class="d num">${cup(x.valor)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Ninguno</td></tr>'}
+        </table></div></div>
+      <div class="tarjeta"><h3>Con stock y sin ventas registradas</h3>
+        <div class="scroll"><table><tr><th>Producto</th><th>Familia</th><th class="d">Stock</th><th class="d">Valor</th></tr>
+        ${d.filasNunca.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.familia)}</td><td class="d num">${fmt(x.stock, 1)}</td><td class="d num">${cup(x.valor)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">Ninguno</td></tr>'}
+        </table></div></div>`;
+  } else if (S.invSub === "fisico") {
+    cuerpo = `<div class="tarjeta"><h3>1. Generar lista para Arqueo</h3>
+      <p class="muted" style="font-size:.86rem">Descarga un JSON filtrado e impórtalo en Arqueo Stock (o úsalo como guía de conteo).</p>
+      <label class="chk"><input type="checkbox" id="arqSoloMin"> Solo bajo mínimo / reponer</label>
+      <label class="campo">Clase ABC (opcional)
+        <select id="arqClase"><option value="">Todas</option><option value="A">A</option><option value="B">B</option><option value="C">C</option></select>
+      </label>
+      <button class="btn sec" data-act="genListaArqueo">Descargar lista JSON</button>
+    </div>
+    <div class="tarjeta"><h3>2. Comparar conteo físico vs sistema</h3>
+      <p class="muted" style="font-size:.86rem">Arqueo → Stock en vivo → IP de esta PC y puerto (ej. 3000). Tras contar, exporta JSON y cárgalo aquí.</p>
+      <input type="file" id="arqueoFile" accept=".json,application/json" style="margin:10px 0">
+      <button class="btn" data-act="importArqueo">Comparar con el sistema</button>
+      <button class="btn sec" data-act="importArqueoAjustes">Informe de ajustes (para AxisPOS)</button>
+      <div id="fisicoRes"></div></div>`;
   } else if (S.invSub === "abc") {
     const d = await get("/api/abc", { clase: S.abcClase });
     const nombres = { A: "Clase A · alta rotación", B: "Clase B · media", C: "Clase C · baja", S: "Sin movimiento" };
@@ -730,13 +1009,14 @@ vistas.inventario = async () => {
 const TIPOS_EV = [["cancel", "Cancelaciones"], ["anular", "Anulaciones"], ["elim", "Líneas quitadas"], ["desc", "Descuentos"], ["login", "Accesos fallidos"], ["cajon", "Cajón abierto"]];
 vistas.perdidas = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["auditoria", "Auditoría"], ["alertas", "Alertas"], ["mermas", "Mermas"], ["eventos", "Eventos"]], S.perSub, "perSub");
+  const tabs = subTabs([["auditoria", "Auditoría"], ["alertas", "Alertas"], ["mermas", "Mermas"], ["devoluciones", "Devoluciones"], ["patrones", "Patrones anulación"], ["eventos", "Eventos"]], S.perSub, "perSub");
   let cuerpo = "";
   if (S.perSub === "auditoria") {
     const d = await get("/api/auditoria", paramsPeriodo());
     if (!aqui(tk)) return;
     const nv = (n) => (n === "alta" ? "alta" : n === "media" ? "media" : "ok");
     cuerpo = `
+      <p style="margin:0 0 8px"><button class="btn sec chico" data-act="printVista">Imprimir / PDF auditoría</button></p>
       <div class="kpis">
         <div class="kpi"><span>Ventas del período</span><b class="num">${cup(d.ventas.total)}</b><small>${fmt(d.ventas.tickets, 0)} tickets</small></div>
         <div class="kpi"><span>Faltante caja</span><b class="num" style="color:var(--rojo)">${cup(d.caja.faltante)}</b></div>
@@ -785,6 +1065,19 @@ vistas.perdidas = async () => {
       <div class="tarjeta"><h3>Cierres de caja con diferencia</h3>${d.cierresConDiferencia.map((t) => `<div class="fila"><div>${e(t.usuario || "")}<small>${fechaHora(t.apertura)}</small></div><div class="d"><span class="etiqueta et-${t.nivel}">${t.diferencia > 0 ? "+" : ""}${fmt(t.diferencia, 0)} CUP</span></div></div>`).join("") || '<p class="muted">Todos los cierres cuadran dentro de la tolerancia.</p>'}
         <p style="margin:10px 0 0"><button class="link" data-act="ir" data-v="caja">Ver todos los turnos en Caja</button></p></div>
       <details class="tarjeta"><summary class="muted" style="cursor:pointer">¿Cómo se deciden las alertas?</summary><p class="muted" style="margin:8px 0 0;font-size:.86rem">Cancelaciones: ${e(d.criterios.cancelTasa)}, o una sola cancelación de monto alto. Líneas quitadas: ${e(d.criterios.lineas)}. Descuentos manuales de ${e(d.criterios.descuento)}. Devoluciones: ${e(d.criterios.devolucion)}. Diferencia de caja: más de ${e(d.criterios.cierre)}. Los umbrales de monto se cambian en Ajustes. Una alerta es una señal para revisar, no una prueba de que algo esté mal.</p></details>`;
+  } else if (S.perSub === "devoluciones") {
+    const d = await get("/api/devoluciones", paramsPeriodo());
+    cuerpo = `<div class="kpis"><div class="kpi"><span>Importe</span><b class="num">${cup(d.total)}</b></div><div class="kpi"><span>Unidades</span><b class="num">${fmt(d.unidades, 0)}</b></div><div class="kpi"><span>Movimientos</span><b class="num">${fmt(d.movimientos, 0)}</b></div></div>
+      <div class="tarjeta"><h3>Por producto</h3>${d.porProducto.map((x) => `<div class="fila"><div>${e(x.nombre)}</div><div class="d num">${fmt(x.cant, 1)} u · ${cup(x.importe)}</div></div>`).join("") || '<p class="muted">Sin datos</p>'}</div>
+      <div class="tarjeta"><h3>Por usuario</h3>${d.porUsuario.map((x) => `<div class="fila"><div>${e(x.usuario)}</div><div class="d num">${fmt(x.n, 0)} mov · ${cup(x.importe)}</div></div>`).join("")}</div>
+      <div class="tarjeta"><h3>Detalle</h3>${d.filas.map((x) => `<div class="fila clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer"><div>${e(x.nombre)}<small>${fechaHora(x.fecha)} · ${e(x.usuario)} · ticket ${x.ticket}</small></div><div class="d num">${fmt(x.cant, 1)} · ${cup(x.importe)}</div></div>`).join("")}</div>`;
+  } else if (S.perSub === "patrones") {
+    const d = await get("/api/patrones-anulacion", paramsPeriodo());
+    const maxH = Math.max(1, ...d.porHora.map((h) => h.n));
+    cuerpo = `<div class="kpis"><div class="kpi"><span>Eventos de anulación/cancelación</span><b class="num">${fmt(d.total, 0)}</b></div></div>
+      <div class="tarjeta"><h3>Por hora del día</h3>${d.porHora.filter((h) => h.n).map((h) => hbar(h.hora + ":00", h.n, maxH, fmt(h.n, 0))).join("") || '<p class="muted">Sin datos</p>'}</div>
+      <div class="tarjeta"><h3>Por usuario</h3>${d.porUsuario.map((x) => `<div class="fila"><div>${e(x.usuario)}</div><div class="d num">${fmt(x.n, 0)}</div></div>`).join("")}</div>
+      <div class="tarjeta"><h3>Recientes</h3>${d.recientes.map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${fechaHora(x.fecha)}</div></div>`).join("") || '<p class="muted">Sin eventos</p>'}</div>`;
   } else if (S.perSub === "mermas") {
     const d = await get("/api/mermas", paramsPeriodo());
     const max = Math.max(1, ...d.categorias.map((c) => c.valor));
@@ -827,7 +1120,10 @@ vistas.ajustes = async () => {
     <form class="tarjeta" id="form-aj"><h3>Alertas y cálculos</h3><div class="filtros" style="align-items:start">
       ${campo("tasa", "Tasa (CUP por USD)", "Solo para mostrar el equivalente")}${campo("plazoRepos", "Días que tarda un pedido", "Para el punto de reposición")}${campo("seguridad", "Días de seguridad", "Colchón extra")}
       ${campo("cobertura", "Días de venta a cubrir al comprar", "Para la lista de compras")}${campo("ventanaVentas", "Días de historial de ventas", "Para la venta diaria y el ABC")}${campo("umbralCancel", "Cancelación grande (CUP)", "Desde este monto se marca")}
-      ${campo("descMax", "Descuento manual alto (%)", "Desde este % se marca")}${campo("tolCierre", "Diferencia de caja tolerada (CUP)", "Más que esto se marca")}</div>
+      ${campo("descMax", "Descuento manual alto (%)", "Desde este % se marca")}${campo("tolCierre", "Diferencia de caja tolerada (CUP)", "Más que esto se marca")}
+      ${campo("horaAperturaMin", "Hora mínima apertura turno", "Ej. 7")}${campo("horaAperturaMax", "Hora máxima apertura turno", "Ej. 10")}
+      ${campo("horasTurnoMax", "Horas máximas de un turno", "Ej. 12")}${campo("metaDiaria", "Meta diaria de ventas (CUP)", "0 = sin meta")}
+      ${campo("costoEstimadoPct", "Costo estimado si falta (%)", "Ej. 10 → costo = precio de venta − 10 %. Para IPV, inversión y márgenes.")}</div>
       <p class="error" id="err-aj" hidden></p><button class="btn">Guardar ajustes</button></form>
     <form class="tarjeta" id="form-db2"><h3>Conexión con MariaDB</h3>${d.db.permisos === "escritura" ? '<div class="aviso-caja">Este usuario de MariaDB puede modificar datos. Es más seguro usar uno de solo lectura (SELECT).</div>' : ""}
       <div class="filtros" style="margin-top:10px"><label class="campo">Servidor<input name="host" value="${e(d.db.host)}"></label><label class="campo">Puerto<input name="puerto" value="${d.db.puerto}"></label><label class="campo">Base de datos<input name="base" value="${e(d.db.base)}"></label>
@@ -843,6 +1139,120 @@ vistas.ajustes = async () => {
     ev.preventDefault();
     try { await post("/api/config/db", Object.fromEntries(new FormData(ev.target))); aviso("Conexión guardada"); vista(true); } catch (err) { const x = $("#err-db"); x.textContent = err.message; x.hidden = false; }
   };
+};
+
+// ---------- Ayuda ----------
+vistas.ayuda = async () => {
+  const tk = S.tk;
+  const rol = S.yo?.rol || "cajero";
+  $("#contenido").innerHTML = `${cab("Ayuda", "Guía de primer uso y explicación de cada sección. Todo funciona en la red local, sin internet.")}
+  <div class="tarjeta ayuda-bloque" id="ayuda-inicio">
+    <h3>1. Primer uso (pasos iniciales)</h3>
+    <ol class="ayuda-lista">
+      <li><b>En la PC de la tienda</b> instala o descomprime Admin POS y ábrelo (o ejecuta <code>npm run servidor</code> y entra a <code>http://localhost:3000</code>).</li>
+      <li><b>Licencia</b> (si aparece): anota el <b>código de esta PC</b>, pide la licencia firmada, pégala y toca Activar. Sin clave pública el programa puede abrir en modo desarrollo.</li>
+      <li><b>MariaDB / AxisPOS</b>: la primera vez pide host, base, usuario y contraseña de solo lectura si es posible. Se guarda cifrada en esta PC.</li>
+      <li><b>PIN del administrador</b>: elige un usuario de AxisPOS con nivel alto y crea un PIN de 4–8 dígitos. Ese PIN es de Admin POS, no el de Windows.</li>
+      <li><b>Resto del equipo</b>: en <b>Ajustes</b> pon PIN y rol (Administrador / Gerente / Cajero) a cada persona que vaya a entrar.</li>
+      <li><b>Desde el móvil</b> (mismo WiFi): abre <code>http://IP-DE-LA-PC:3000</code>. La IP suele verse al arrancar o en el diagnóstico de red.</li>
+      <li><b>Bandeja del sistema</b> (versión .exe): puedes dejar el servidor corriendo sin tener el panel abierto y entrar solo desde el teléfono.</li>
+    </ol>
+    <p class="muted" style="font-size:.86rem;margin:8px 0 0">Si algo falla al conectar, usa el diagnóstico de red en la pantalla inicial (antes del PIN) y revisa firewall de Windows y que MariaDB acepte conexiones locales.</p>
+  </div>
+
+  <div class="tarjeta ayuda-bloque">
+    <h3>2. Barra superior y temas</h3>
+    <ul class="ayuda-lista">
+      <li><b>Hoy / 7 días / 30 días / 90 días / Todo / Fechas</b>: filtra casi todos los reportes. “Fechas” permite un rango personalizado.</li>
+      <li><b>🔍 Buscar</b>: localiza tickets, productos o cajeros según el texto.</li>
+      <li><b>🌙 / ☀️</b>: cambia entre tema oscuro y claro (se recuerda en este dispositivo).</li>
+      <li><b>Aa</b>: texto más grande y otras preferencias de pantalla.</li>
+      <li>Tu nombre abre el menú de sesión (salir, etc.).</li>
+    </ul>
+  </div>
+
+  <div class="tarjeta ayuda-bloque">
+    <h3>3. Secciones de la aplicación</h3>
+
+    <details class="ayuda-det" open>
+      <summary><b>Resumen</b></summary>
+      <p>Vista general del negocio en el periodo elegido: ventas, tickets, ticket medio, faltantes de caja, ganancia cuando hay costos, gráficos de ventas por día, por hora y por día de la semana, y ventas por familia. Ideal para “cómo vamos hoy”.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Ventas</b></summary>
+      <p>Listado de tickets del periodo. Puedes filtrar y abrir el detalle. Las <b>anulaciones</b> permiten ver la venta original antes de anular. Sirve para auditorías puntuales y reclamos.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Productos</b></summary>
+      <p>Catálogo, top de productos, cambios de precio (quién cambió), márgenes y costos. Si un producto no tiene costo en AxisPOS, en Ajustes puedes definir un % estimado (ej. precio − 10 %) para aproximar ganancia e inversión.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Existencias</b></summary>
+      <p>Stock actual por almacén/punto de venta, valoración de inventario (cuánto hay invertido) y sugerencias de <b>traspaso</b> desde almacén al POS según mínimo y ritmo de venta.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Caja</b></summary>
+      <p>Cierres y conciliaciones: ventas, efectivo, tarjeta, transferencia, esperado vs contado y diferencia. La <b>tolerancia</b> (en Ajustes) define desde cuándo se marca faltante/sobrante. No confundir “cuadra el medio de pago” con “cuadra el efectivo del cajón”.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Equipo</b></summary>
+      <p>Desempeño por cajero: ventas, anulaciones, señales de caja y productividad. Útil para turnos y seguimiento del personal (gerente y admin).</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Inventario</b></summary>
+      <p>IPV (inicio, movimientos, final), cruce con conteo físico / Arqueo, exportación JSON filtrada para contar en el móvil, e informe de ajustes sugeridos (sin escribir solo en AxisPOS hasta que tú lo apliques). Incluye impresión/PDF orientado a auditoría.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Pérdidas</b></summary>
+      <p>Mermas por producto y totales, cancelaciones grandes, descuentos altos y otras señales de riesgo. Pensado para ver “qué se está perdiendo” con claridad.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Ajustes</b> ${rol === "admin" ? "" : "<span class='pill'>Solo administrador</span>"}</summary>
+      <p>PIN y rol de cada usuario, tolerancia de caja, umbrales de alertas, meta diaria, horario de turno, % de costo estimado y datos de conexión MariaDB. El gerente no ve esta pantalla; el cajero tampoco.</p>
+    </details>
+    <details class="ayuda-det">
+      <summary><b>Ayuda</b></summary>
+      <p>Esta guía. Disponible para todos los roles.</p>
+    </details>
+  </div>
+
+  <div class="tarjeta ayuda-bloque">
+    <h3>4. Roles</h3>
+    <ul class="ayuda-lista">
+      <li><b>Administrador</b>: acceso total, incluida la configuración y los PIN.</li>
+      <li><b>Gerente</b>: opera y audita (ventas, caja, inventario, pérdidas) sin cambiar la conexión ni los PIN.</li>
+      <li><b>Cajero</b>: resumen y consulta de ventas/productos/existencias/caja según permisos; no ve inventario avanzado ni ajustes.</li>
+    </ul>
+  </div>
+
+  <div class="tarjeta ayuda-bloque">
+    <h3>5. Arqueo e inventario físico</h3>
+    <ol class="ayuda-lista">
+      <li>En Inventario exporta o usa el stock en vivo hacia la app de <b>Arqueo</b>.</li>
+      <li>Cuenta en el local y guarda el JSON del conteo.</li>
+      <li>Impórtalo aquí para ver faltantes/sobrantes y el informe de ajustes sugeridos.</li>
+      <li>Los movimientos en AxisPOS (entradas, ventas, mermas) alimentan el IPV inicio → final.</li>
+    </ol>
+  </div>
+
+  <div class="tarjeta ayuda-bloque">
+    <h3>6. Licencias</h3>
+    <p>Cada PC tiene un código. La licencia firmada se activa una vez y queda en esta máquina. No necesita internet. Si vence o cambias de equipo, hay que emitir otra con el generador (misma llave pública que la del programa).</p>
+  </div>
+
+  <div class="tarjeta ayuda-bloque">
+    <h3>7. Problemas frecuentes</h3>
+    <ul class="ayuda-lista">
+      <li><b>No conecta MariaDB</b>: revisa usuario/clave/base, que el servicio esté activo y el firewall.</li>
+      <li><b>El móvil no abre el panel</b>: misma WiFi, IP correcta, puerto 3000 permitido, servidor en marcha (bandeja o ventana).</li>
+      <li><b>Olvidé el PIN del admin</b>: en la PC local, opción de restablecer con la contraseña de MariaDB (borra los PIN y vuelve a crear el del admin).</li>
+      <li><b>Números de caja raros</b>: mira la tolerancia y separa diferencia de efectivo vs otros medios de pago.</li>
+      <li><b>Sin costos / márgenes en cero</b>: completa PriceIn en AxisPOS o usa el % de costo estimado en Ajustes.</li>
+    </ul>
+  </div>
+
+  <p class="muted" style="text-align:center;font-size:.84rem">Admin POS lee AxisPOS en local. No sustituye el POS de venta: es el panel de control, auditoría e inventario.</p>`;
+  if (!aqui(tk)) return;
 };
 
 // ---------- Acciones (clics) ----------
@@ -864,13 +1274,119 @@ const ACC = {
   ir: (el) => { cerrarModal(); ir(el.dataset.v); },
   periodo: (el) => {
     S.periodo = el.dataset.v;
+    if (S.periodo !== "custom") LS.set("periodoPref", S.periodo);
     S.ventas.pagina = S.prod.pagina = S.exis.pagina = S.cajaPag = S.ev.pagina = 1;
     marcarNav();
     if (S.periodo === "custom") {
-      // No recargar hasta que elijan fechas y pulsen Ver
       if (!S.desde || !S.hasta) return;
     }
     vista();
+  },
+  buscarGlobal: () => {
+    abrirModal(`<div class="dialogo busqueda-box"><h3>Búsqueda global</h3>
+      <input type="search" id="qGlobal" placeholder="Ticket, producto o cajero…" autofocus>
+      <div id="resGlobal" class="muted" style="margin-top:10px;min-height:40px">Escribe al menos 2 caracteres</div>
+      <button class="btn sec" data-act="cerrarModal">Cerrar</button></div>`);
+    const inp = $("#qGlobal");
+    let t;
+    inp.oninput = () => {
+      clearTimeout(t);
+      t = setTimeout(async () => {
+        const q = inp.value.trim();
+        if (q.length < 2) { $("#resGlobal").textContent = "Escribe al menos 2 caracteres"; return; }
+        try {
+          const d = await get("/api/buscar", paramsPeriodo({ q }));
+          $("#resGlobal").innerHTML = `
+            <h4 style="margin:8px 0 4px">Tickets</h4>
+            ${(d.tickets || []).map((x) => `<div class="fila clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer"><div>#${x.ticket} · ${e(x.cajero)}<small>${fechaHora(x.fecha)}</small></div><div class="d num">${cup(x.total)}</div></div>`).join("") || '<p class="muted">Ninguno</p>'}
+            <h4 style="margin:12px 0 4px">Productos</h4>
+            ${(d.productos || []).map((x) => `<div class="fila clic" data-act="prodTx" data-id="${x.id}" style="cursor:pointer"><div>${e(x.nombre)}<small>${e(x.codigo || "")}</small></div><div class="d num">${cup(x.precio)}</div></div>`).join("") || '<p class="muted">Ninguno</p>'}
+            <h4 style="margin:12px 0 4px">Usuarios</h4>
+            ${(d.usuarios || []).map((x) => `<div class="fila"><div>${e(x.nombre)}</div></div>`).join("") || '<p class="muted">Ninguno</p>'}`;
+        } catch (err) { $("#resGlobal").textContent = err.message; }
+      }, 300);
+    };
+  },
+  toggleTema: () => {
+    const oscuro = LS.get("tema") !== "oscuro";
+    LS.set("tema", oscuro ? "oscuro" : "");
+    aplicarPrefs();
+    const b = document.getElementById("btnTema");
+    if (b) b.textContent = oscuro ? "☀️ Claro" : "🌙 Oscuro";
+  },
+  prefsUI: () => {
+    abrirModal(`<div class="dialogo"><h3>Preferencias de pantalla</h3>
+      <label class="chk"><input type="checkbox" id="prefOscuro" ${LS.get("tema") === "oscuro" ? "checked" : ""}> Modo oscuro</label>
+      <label class="chk"><input type="checkbox" id="prefGrande" ${LS.get("fuente") === "grande" ? "checked" : ""}> Texto más grande</label>
+      <p class="muted" style="font-size:.84rem">También puedes usar el botón 🌙/☀️ de la barra superior.</p>
+      <button class="btn" data-act="guardarPrefs">Guardar</button>
+      <button class="btn sec" data-act="cerrarModal">Cerrar</button></div>`);
+  },
+  guardarPrefs: () => {
+    LS.set("tema", $("#prefOscuro")?.checked ? "oscuro" : "");
+    LS.set("fuente", $("#prefGrande")?.checked ? "grande" : "");
+    aplicarPrefs();
+    const b = document.getElementById("btnTema");
+    if (b) b.textContent = LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro";
+    cerrarModal();
+    aviso("Preferencias guardadas");
+  },
+  toggleFav: (el) => { toggleFav(el.dataset.v); vista(true); },
+  irFav: (el) => { S.vista = el.dataset.v; vista(); },
+  comparar: async () => {
+    abrirModal(`<div class="dialogo"><h3>Comparar dos períodos</h3>
+      <p class="muted">Período A = el de la barra superior. Período B:</p>
+      <label class="campo">Desde B<input type="date" id="cDesde"></label>
+      <label class="campo">Hasta B<input type="date" id="cHasta"></label>
+      <button class="btn" data-act="runComparar">Comparar</button>
+      <button class="btn sec" data-act="cerrarModal">Cerrar</button>
+      <div id="cmpRes"></div></div>`);
+  },
+  runComparar: async () => {
+    const d2 = $("#cDesde")?.value, h2 = $("#cHasta")?.value;
+    if (!d2 || !h2) { aviso("Elige ambas fechas de B"); return; }
+    try {
+      const d = await get("/api/comparar", paramsPeriodo({ desde2: d2, hasta2: h2 }));
+      if (d.error) { aviso(d.error); return; }
+      const pct = (x) => x == null ? "—" : fmt(x * 100, 1) + " %";
+      $("#cmpRes").innerHTML = `<div class="rt" style="margin-top:12px">
+        <div><span>Ventas A</span><b class="num">${cup(d.a.total)}</b></div>
+        <div><span>Ventas B</span><b class="num">${cup(d.b.total)}</b></div>
+        <div><span>Δ ventas</span><b class="num">${cup(d.delta.total)} (${pct(d.delta.totalPct)})</b></div>
+        <div><span>Tickets A / B</span><b class="num">${fmt(d.a.tickets,0)} / ${fmt(d.b.tickets,0)}</b></div>
+        <div><span>Δ tickets</span><b class="num">${d.delta.tickets} (${pct(d.delta.ticketsPct)})</b></div>
+        <div><span>Caja fuera A / B</span><b class="num">${d.a.cajaFuera} / ${d.b.cajaFuera}</b></div>
+      </div>`;
+    } catch (err) { aviso(err.message); }
+  },
+  diagRed: async () => {
+    const box = $("#diagRes");
+    if (box) box.textContent = "Probando…";
+    try {
+      const t0 = Date.now();
+      const d = await get("/api/diagnostico");
+      const ms = Date.now() - t0;
+      const txt = d.ok
+        ? `✅ Conectado · ida y vuelta ${ms} ms · BD ${d.dbMs} ms · ${fmt(d.productos,0)} productos · ${e(d.version)}`
+        : `❌ BD no responde: ${e(d.error || "error")}`;
+      if (box) box.textContent = txt; else aviso(txt);
+    } catch (err) {
+      if (box) box.textContent = "❌ " + err.message; else aviso(err.message);
+    }
+  },
+  printVista: () => window.print(),
+  genListaArqueo: async () => {
+    try {
+      const soloMin = $("#arqSoloMin")?.checked ? "1" : "0";
+      const clase = $("#arqClase")?.value || "";
+      const d = await get("/api/lista-arqueo", paramsPeriodo({ soloMin, clase }));
+      const blob = new Blob([JSON.stringify(d, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `lista-arqueo-${d.n}.json`;
+      a.click();
+      aviso(`Lista generada: ${d.n} productos`);
+    } catch (err) { aviso(err.message); }
   },
   aplicarFechas: () => {
     const d = $("#desde")?.value, h = $("#hasta")?.value;
@@ -883,7 +1399,53 @@ const ACC = {
   ticket: (el) => abrirTicket(el.dataset.acct),
   recargar: () => vista(),
   reintentar: () => iniciar(),
+  copiarMc: async () => {
+    const t = ($("#mcLic")?.textContent || "").trim();
+    if (!t || t === "—") return;
+    try {
+      await navigator.clipboard.writeText(t);
+      aviso("Código copiado");
+    } catch {
+      const r = document.createRange();
+      r.selectNodeContents($("#mcLic"));
+      const s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      aviso("Código seleccionado · copia con Ctrl+C");
+    }
+  },
+  activarLic: async () => {
+    const token = ($("#tokLic")?.value || "").trim();
+    const err = $("#errLic");
+    const ok = $("#okLic");
+    const btn = $("#btnActivarLic");
+    if (err) { err.hidden = true; err.textContent = ""; }
+    if (ok) { ok.hidden = true; ok.textContent = ""; }
+    if (!token) {
+      if (err) { err.textContent = "Pega el texto completo de la licencia."; err.hidden = false; }
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = "Activando…"; }
+    try {
+      const r = await post("/api/licencia/activar", { token });
+      if (ok) {
+        ok.textContent = r.expira
+          ? `Licencia activada · válida hasta ${r.expira}${r.cliente ? " · " + r.cliente : ""}`
+          : "Licencia activada correctamente.";
+        ok.hidden = false;
+      }
+      aviso("Licencia activada");
+      setTimeout(() => iniciar(), 600);
+    } catch (e) {
+      if (err) { err.textContent = e.message || "Licencia no válida"; err.hidden = false; }
+      else aviso(e.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "Activar licencia"; }
+    }
+  },
   conectar: conectarServidor,
+  probarDiag: () => window.__probarDiag && window.__probarDiag(),
+  cerrarModal: () => cerrarModal(),
   cambiarServidor: () => { LS.set("servidor", ""); S.base = ""; pantallaServidor(); },
   cambiarDb: () => pantallaDb("", {}),
   seguirDb: () => iniciar(),
@@ -898,6 +1460,7 @@ const ACC = {
   perSub: (el) => { S.perSub = el.dataset.v; vista(); },
   ventasSub: (el) => { S.ventas.sub = el.dataset.v; S.ventas.pagina = 1; vista(); },
   prodSub: (el) => { S.prod.sub = el.dataset.v; S.prod.pagina = 1; vista(); },
+  eqSub: (el) => { S.eqSub = el.dataset.v; vista(); },
   prodTx: (el) => abrirProdTx(el.dataset.id, 1),
   prodTxPag: (el) => abrirProdTx(el.dataset.id, Number(el.dataset.n) || 1),
   verEventos: (el) => { S.ev = { tipo: el.dataset.tipo, usuario: el.dataset.u, nombre: el.dataset.nombre, pagina: 1 }; S.perSub = "eventos"; vista(); },
@@ -911,6 +1474,55 @@ const ACC = {
     } catch (err) { aviso(err.message); }
   },
   csvCompras: () => descargarCSV("compras-sugeridas.csv", [["Producto", "Clase", "Stock", "Venta diaria", "Pedir", "Costo estimado"], ...(S.comprasCsv || []).map((x) => [x.nombre, x.clase, x.stock, x.diaria.toFixed(2), x.pedir, x.estimado ?? ""])]),
+  importArqueoAjustes: async () => {
+    const inp = document.getElementById("arqueoFile");
+    if (!inp?.files?.length) { aviso("Elige el JSON exportado desde Arqueo Stock"); return; }
+    try {
+      const txt = await inp.files[0].text();
+      const data = JSON.parse(txt);
+      const body = Array.isArray(data) ? { items: data } : data.productos ? { items: data.productos } : data;
+      const r = await post("/api/fisico?modo=ajustes", body);
+      const box = document.getElementById("fisicoRes");
+      if (!box) return;
+      box.innerHTML = `<p class="aviso-caja">${e(r.mensaje || "")}</p>
+        <div class="kpis"><div class="kpi"><span>Ajustes</span><b class="num">${fmt((r.filas||[]).length,0)}</b></div>
+          <div class="kpi"><span>Valor faltante</span><b class="num">${cup(r.resumen?.valorFaltante||0)}</b></div>
+          <div class="kpi"><span>Valor sobrante</span><b class="num">${cup(r.resumen?.valorSobrante||0)}</b></div></div>
+        <div class="scroll"><table><tr><th>Producto</th><th class="d">Sistema</th><th class="d">Físico</th><th class="d">Dif.</th><th>Acción sugerida</th></tr>
+        ${(r.filas||[]).map((x)=>`<tr><td>${e(x.nombre)}<small>${e(x.codigo)}</small></td><td class="d num">${fmt(x.sistema,1)}</td><td class="d num">${fmt(x.fisico,1)}</td>
+          <td class="d num">${x.diferencia>0?"+":""}${fmt(x.diferencia,1)}</td><td>${e(x.accion)}<small>${e(x.tipoAxis)}</small></td></tr>`).join("")}
+        </table></div>
+        <button class="link" data-act="printVista">Imprimir / PDF</button>`;
+      S.fisicoCsv = r.filas;
+    } catch (err) { aviso(err.message || "No se pudo leer el archivo"); }
+  },
+  importArqueo: async () => {
+    const inp = document.getElementById("arqueoFile");
+    if (!inp?.files?.length) { aviso("Elige el JSON exportado desde Arqueo Stock"); return; }
+    try {
+      const txt = await inp.files[0].text();
+      const data = JSON.parse(txt);
+      const body = Array.isArray(data) ? { items: data } : data.productos ? { items: data.productos } : data;
+      const r = await post("/api/fisico", body);
+      const box = document.getElementById("fisicoRes");
+      if (!box) return;
+      const s = r.resumen;
+      box.innerHTML = `<div class="kpis" style="margin-top:12px">
+        <div class="kpi"><span>Comparados</span><b class="num">${fmt(s.comparados, 0)}</b></div>
+        <div class="kpi"><span>OK</span><b class="num">${fmt(s.ok, 0)}</b></div>
+        <div class="kpi"><span>Faltante</span><b class="num" style="color:var(--rojo)">${fmt(s.faltante, 0)}</b><small>${cup(s.valorFaltante)}</small></div>
+        <div class="kpi"><span>Sobrante</span><b class="num" style="color:var(--verde)">${fmt(s.sobrante, 0)}</b><small>${cup(s.valorSobrante)}</small></div>
+      </div>
+      <div class="scroll"><table><tr><th>Producto</th><th class="d">Sistema</th><th class="d">Físico</th><th class="d">Dif.</th><th class="d">Valor</th></tr>
+      ${r.filas.map((x) => `<tr><td>${e(x.nombre)}<small>${e(x.codigo)}</small></td><td class="d num">${fmt(x.sistema, 1)}</td><td class="d num">${fmt(x.fisico, 1)}</td>
+        <td class="d num" style="color:${x.estado === "faltante" ? "var(--rojo)" : x.estado === "sobrante" ? "var(--verde)" : "inherit"}">${x.diferencia > 0 ? "+" : ""}${fmt(x.diferencia, 1)}</td>
+        <td class="d num">${cup(x.valor)}</td></tr>`).join("")}
+      </table></div>
+      <button class="link" data-act="csvFisico">Exportar CSV</button>`;
+      S.fisicoCsv = r.filas;
+    } catch (err) { aviso(err.message || "No se pudo leer el archivo"); }
+  },
+  csvFisico: () => descargarCSV("inventario-fisico.csv", [["Producto", "Código", "Sistema", "Físico", "Diferencia", "Valor"], ...(S.fisicoCsv || []).map((x) => [x.nombre, x.codigo, x.sistema, x.fisico, x.diferencia, x.valor])]),
 };
 
 document.addEventListener("click", (ev) => {

@@ -24,8 +24,17 @@ Esta versión combina **todas** las características de las dos aplicaciones ant
 2. Elige al administrador de AxisPOS y crea su PIN (4 a 8 números).
 3. En **Ajustes** pon el PIN de cada usuario y su rol. Sin PIN no se entra.
 
+## Servidor en segundo plano (móvil sin abrir el panel)
+- Al cerrar la ventana, **Admin POS no se apaga**: queda en la **bandeja del sistema** (icono junto al reloj) con el servidor activo.
+- Clic derecho en el icono → **Iniciar con Windows**: al encender la PC el servidor arranca solo (sin ventana).
+- Para salir del todo: clic derecho → **Salir (apaga el servidor)**.
+- En el menú del icono ves las URLs para el móvil (`http://192.168.x.x:3000`).
+
 ## En el teléfono
-Instala la APK, escribe la dirección que ves en la PC (ej. http://192.168.1.10:3000) y entra con tu PIN. La PC debe estar encendida y en el mismo WiFi.
+1. La **PC debe estar encendida** (MariaDB + Admin POS en bandeja).
+2. Mismo WiFi que la PC.
+3. Instala la APK (o el navegador), escribe `http://IP-DE-LA-PC:3000` y entra con tu PIN.
+4. **No hace falta** tener abierta la ventana del panel; solo el icono en la bandeja.
 
 ## Roles
 - **Administrador:** todo, incluido Ajustes (PIN, roles, conexión, umbrales).

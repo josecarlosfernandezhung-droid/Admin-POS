@@ -275,3 +275,51 @@ html.oscuro .lic-token { background:#0f172a; }
 .ayuda-det p { margin:8px 0 0; color:var(--muted); font-size:.92rem; }
 .ayuda-bloque .pill { margin-left:6px; font-size:.72rem; padding:2px 8px; border-radius:999px; background:var(--acento-suave); color:var(--acento); }
 .ayuda-bloque code { font-size:.84em; background:var(--acento-suave); padding:1px 6px; border-radius:6px; }
+
+
+/* ===== Arreglos de lectura en móvil: nada pegado, apilado ni desbordado ===== */
+/* Texto secundario dentro de tablas: siempre en su propia línea */
+td small, th small, td .muted2 { display:block; color:var(--muted); font-size:.8rem; margin-top:2px; white-space:normal; font-weight:400; }
+/* Separación entre columnas (evita "TicketsQuién", "6Rafael") */
+th + th, td + td { padding-left:14px; }
+th.d, td.d { padding-left:14px; }
+td, th { overflow-wrap:break-word; }
+td:first-child { min-width:120px; overflow-wrap:anywhere; }
+/* Primera columna fija al desplazar tablas anchas, para no perder el nombre */
+.scroll table td:first-child, .scroll table th:first-child { position:sticky; left:0; z-index:1; background:var(--tarjeta); padding-right:10px; }
+/* Listas (.fila): el texto ocupa lo que sobra y el lado derecho puede partir línea */
+.fila > div:first-child, .fila > span:last-child { flex:1 1 0; min-width:0; overflow-wrap:anywhere; }
+.fila .d { flex:0 1 auto; max-width:58%; white-space:normal; overflow-wrap:anywhere; text-align:right; }
+.fila .d.num { white-space:nowrap; }
+.fila .d small { display:block; white-space:normal; margin-top:3px; }
+.fila .d .etiqueta { white-space:nowrap; }
+/* Alertas al abrir: etiqueta de ancho fijo, texto a su lado, sin estirarse */
+.alerta-fila { align-items:flex-start; gap:12px; }
+.alerta-fila .etiqueta { flex:0 0 66px; width:66px; text-align:center; align-self:flex-start; margin-top:2px; padding:3px 0; }
+.alerta-fila .alerta-txt { flex:1 1 0; min-width:0; line-height:1.35; }
+/* Etiquetas nunca se estiran a lo alto dentro de filas flex */
+.fila .etiqueta { align-self:flex-start; }
+.tarjeta { overflow:hidden; min-width:0; }
+.tarjeta h3 { flex-wrap:wrap; }
+
+/* Selector de almacenes */
+.alm-fila { align-items:center; gap:12px; cursor:pointer; }
+.alm-fila input { width:22px; height:22px; flex:0 0 auto; accent-color:var(--acento); }
+.alm-fila .alm-nombre { flex:1 1 0; min-width:0; }
+.alm-btns { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+
+/* Rotación: el texto no se agranda solo al girar y, en horizontal, la barra no ocupa media pantalla */
+html { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
+@media (orientation: landscape) and (max-height: 520px) {
+  .barra { position:static; padding-top:8px; }
+  .marca { padding-bottom:6px; }
+  .marca img { width:32px; height:32px; }
+  .marca h2 { font-size:1.15rem; }
+  .periodo { margin-bottom:6px; }
+  .herramientas { margin-bottom:6px; }
+  .contenido { max-width:100%; }
+  .dialogo { max-height:96vh; }
+}
+@media (orientation: landscape) and (min-width:600px) and (max-height: 520px) {
+  .kpis { grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+}

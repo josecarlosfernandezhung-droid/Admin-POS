@@ -523,7 +523,7 @@ vistas.resumen = async (silencio) => {
   const vc = (v, txt) => (v == null ? `<div class="v muted">${txt}</div>` : `<div class="v ${claseVar(v)}">${v >= 0 ? "▲" : "▼"} ${signo(v)} ${txt}</div>`);
   const maxFam = Math.max(1, ...d.familias.map((f) => f.total));
   const bloqAlertas = alertas?.items?.length
-    ? `<div class="tarjeta"><h3>Alertas al abrir</h3>${alertas.items.map((a) => `<div class="fila"><span class="etiqueta et-${a.nivel === "ok" ? "ok" : a.nivel === "alta" ? "alta" : "media"}">${a.nivel}</span><span style="margin-left:8px">${e(a.texto)}</span></div>`).join("")}</div>`
+    ? `<div class="tarjeta"><h3>Alertas al abrir</h3>${alertas.items.map((a) => `<div class="fila alerta-fila"><span class="etiqueta et-${a.nivel === "ok" ? "ok" : a.nivel === "alta" ? "alta" : "media"}">${a.nivel}</span><span class="alerta-txt">${e(a.texto)}</span></div>`).join("")}</div>`
     : "";
   const bloqPanel = panel && !solo
     ? `<div class="kpis">
@@ -1126,6 +1126,10 @@ vistas.ajustes = async () => {
       ${campo("horasTurnoMax", "Horas máximas de un turno", "Ej. 12")}${campo("metaDiaria", "Meta diaria de ventas (CUP)", "0 = sin meta")}
       ${campo("costoEstimadoPct", "Costo estimado si falta (%)", "Ej. 10 → costo = precio de venta − 10 %. Para IPV, inversión y márgenes.")}</div>
       <p class="error" id="err-aj" hidden></p><button class="btn">Guardar ajustes</button></form>
+    <form class="tarjeta" id="form-alm"><h3>Almacenes visibles</h3><p class="muted" style="margin:-4px 0 8px;font-size:.86rem">Marca los almacenes que quieres ver en Existencias, Inventario, IPV y Traspasos. Los desmarcados se ocultan de esas pantallas (los datos no se borran).</p>
+      ${(d.almacenes || []).map((x) => `<label class="fila alm-fila"><input type="checkbox" name="alm" value="${x.id}" ${(a.almacenesOcultos || []).includes(x.id) ? "" : "checked"}><span class="alm-nombre">${e(x.nombre)}<small>${fmt(x.productos, 0)} productos · ${fmt(x.piezas, 0)} piezas</small></span></label>`).join("") || '<p class="muted">No se encontraron almacenes.</p>'}
+      <div class="alm-btns"><button type="button" class="btn sec chico" data-act="almTodos" data-v="1">Marcar todos</button><button type="button" class="btn sec chico" data-act="almTodos" data-v="0">Desmarcar todos</button></div>
+      <p class="error" id="err-alm" hidden></p><button class="btn">Guardar almacenes</button></form>
     <form class="tarjeta" id="form-db2"><h3>Conexión con MariaDB</h3>${d.db.permisos === "escritura" ? '<div class="aviso-caja">Este usuario de MariaDB puede modificar datos. Es más seguro usar uno de solo lectura (SELECT).</div>' : ""}
       <div class="filtros" style="margin-top:10px"><label class="campo">Servidor<input name="host" value="${e(d.db.host)}"></label><label class="campo">Puerto<input name="puerto" value="${d.db.puerto}"></label><label class="campo">Base de datos<input name="base" value="${e(d.db.base)}"></label>
       <label class="campo">Usuario<input name="usuario" value="${e(d.db.usuario)}" autocapitalize="none"></label><label class="campo">Contraseña (vacía = no cambiar)<input name="clave" type="password" autocomplete="off"></label></div>
@@ -1135,6 +1139,13 @@ vistas.ajustes = async () => {
     const v = Object.fromEntries(new FormData(ev.target));
     for (const k in v) v[k] = Number(String(v[k]).replace(",", "."));
     try { await post("/api/ajustes/params", v); aviso("Ajustes guardados"); } catch (err) { const x = $("#err-aj"); x.textContent = err.message; x.hidden = false; }
+  };
+  $("#form-alm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const todos = [...ev.target.querySelectorAll("input[name=alm]")];
+    const ocultos = todos.filter((i) => !i.checked).map((i) => Number(i.value));
+    if (todos.length && ocultos.length === todos.length) { const x = $("#err-alm"); x.textContent = "Deja al menos un almacén visible."; x.hidden = false; return; }
+    try { await post("/api/ajustes/almacenes", { ocultos }); aviso("Almacenes guardados"); } catch (err) { const x = $("#err-alm"); x.textContent = err.message; x.hidden = false; }
   };
   $("#form-db2").onsubmit = async (ev) => {
     ev.preventDefault();
@@ -1414,6 +1425,9 @@ const ACC = {
       s.addRange(r);
       aviso("Código seleccionado · copia con Ctrl+C");
     }
+  },
+  almTodos: (el) => {
+    document.querySelectorAll("#form-alm input[name=alm]").forEach((i) => { i.checked = el.dataset.v === "1"; });
   },
   activarLic: async () => {
     const token = ($("#tokLic")?.value || "").trim();

@@ -163,6 +163,32 @@ function cargarClavePublica(rawB64) {
   }
 }
 
+function derInt(b) {
+  let i = 0;
+  while (i < b.length - 1 && b[i] === 0) i++;
+  b = b.subarray(i);
+  if (b[0] & 0x80) b = Buffer.concat([Buffer.from([0]), b]);
+  return Buffer.concat([Buffer.from([0x02, b.length]), b]);
+}
+
+function p1363aDer(sig) {
+  const r = derInt(sig.subarray(0, 32));
+  const sv = derInt(sig.subarray(32, 64));
+  const cuerpo = Buffer.concat([r, sv]);
+  return Buffer.concat([Buffer.from([0x30, cuerpo.length]), cuerpo]);
+}
+
+/** Huella corta de la clave pública cargada (para comparar con el generador). */
+export function huellaClave() {
+  try {
+    if (!pubKey) return null;
+    const der = pubKey.export({ type: "spki", format: "der" });
+    return createHash("sha256").update(der).digest("hex").slice(0, 12).toUpperCase();
+  } catch {
+    return null;
+  }
+}
+
 function ub64(s) {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
@@ -281,11 +307,17 @@ export function verificarToken(token, mcEsperado = codigoPC()) {
       }
     } catch {}
   }
+  // Respaldo: convierte r||s a DER a mano (Node viejo que ignora dsaEncoding)
+  if (!okSig && sigBuf.length === 64) {
+    try {
+      okSig = verify("SHA-256", payloadBuf, pubKey, p1363aDer(sigBuf));
+    } catch {}
+  }
   if (!okSig) {
     return {
       ok: false,
       error:
-        "Firma no válida. Casi siempre: (1) la clave pública de esta app no es la del generador que firmó, o (2) la licencia se pegó cortada. Copia de nuevo la clave pública del generador a server/clave_publica.txt y vuelve a generar la licencia con el código de esta PC.",
+        `Firma no válida. Huella de la clave de esta app: ${huellaClave()} · Node ${process.versions.node}. Casi siempre: (1) la clave pública de esta app no es la del generador que firmó, o (2) la licencia se pegó cortada.`,
     };
   }
 
@@ -378,6 +410,8 @@ export function estadoLicencia() {
       mcFmt: codigoFormateado(),
       error: "No hay licencia activada",
       tieneClavePublica: true,
+      huella: huellaClave(),
+      node: process.versions.node,
     };
   }
 
@@ -404,6 +438,8 @@ export function estadoLicencia() {
     mc,
     mcFmt: codigoFormateado(),
     tieneClavePublica: true,
+    huella: huellaClave(),
+    node: process.versions.node,
   };
 }
 

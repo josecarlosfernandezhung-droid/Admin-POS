@@ -189,6 +189,68 @@ export function huellaClave() {
   }
 }
 
+
+// ---- ECDSA P-256 + SHA-256 en JS puro (BigInt) ----
+const P256 = {
+  p: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn,
+  n: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n,
+  a: 0xffffffff00000001000000000000000000000000fffffffffffffffffffffffcn,
+  gx: 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n,
+  gy: 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n,
+};
+const mod = (a, m) => ((a % m) + m) % m;
+function powMod(b, e, m) {
+  let r = 1n;
+  b = mod(b, m);
+  while (e > 0n) {
+    if (e & 1n) r = (r * b) % m;
+    b = (b * b) % m;
+    e >>= 1n;
+  }
+  return r;
+}
+const invMod = (a, m) => powMod(a, m - 2n, m); // m es primo
+function ptAdd(P1, P2) {
+  if (!P1) return P2;
+  if (!P2) return P1;
+  const p = P256.p;
+  let l;
+  if (P1[0] === P2[0]) {
+    if (mod(P1[1] + P2[1], p) === 0n) return null;
+    l = mod((3n * P1[0] * P1[0] + P256.a) * invMod(2n * P1[1], p), p);
+  } else {
+    l = mod((P2[1] - P1[1]) * invMod(P2[0] - P1[0], p), p);
+  }
+  const x = mod(l * l - P1[0] - P2[0], p);
+  return [x, mod(l * (P1[0] - x) - P1[1], p)];
+}
+function ptMul(k, pt) {
+  let r = null;
+  while (k > 0n) {
+    if (k & 1n) r = ptAdd(r, pt);
+    pt = ptAdd(pt, pt);
+    k >>= 1n;
+  }
+  return r;
+}
+const bufABig = (b) => BigInt("0x" + Buffer.from(b).toString("hex"));
+
+function verificarP256JS(msg, sig) {
+  if (!pubKey || sig.length !== 64) return false;
+  const der = pubKey.export({ type: "spki", format: "der" });
+  const pt = der.subarray(der.length - 65);
+  if (pt[0] !== 0x04) return false;
+  const Q = [bufABig(pt.subarray(1, 33)), bufABig(pt.subarray(33, 65))];
+  const r = bufABig(sig.subarray(0, 32));
+  const sv = bufABig(sig.subarray(32, 64));
+  const { n } = P256;
+  if (r < 1n || r >= n || sv < 1n || sv >= n) return false;
+  const e = bufABig(createHash("sha256").update(msg).digest());
+  const w = invMod(sv, n);
+  const X = ptAdd(ptMul(mod(e * w, n), [P256.gx, P256.gy]), ptMul(mod(r * w, n), Q));
+  return !!X && mod(X[0], n) === r;
+}
+
 function ub64(s) {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
@@ -299,25 +361,40 @@ export function verificarToken(token, mcEsperado = codigoPC()) {
 
   // WebCrypto firma en IEEE P1363 (r||s); también probamos DER
   let okSig = false;
-  for (const enc of ["ieee-p1363", "der"]) {
-    try {
-      if (verify("SHA-256", payloadBuf, { key: pubKey, dsaEncoding: enc }, sigBuf)) {
-        okSig = true;
-        break;
+  let errCrypto = "";
+  if (process.env.ADMINPOS_SOLO_JS !== "1") {
+    for (const alg of ["sha256", "SHA256", "SHA-256"]) {
+      for (const enc of ["ieee-p1363", "der"]) {
+        if (okSig) break;
+        try {
+          if (verify(alg, payloadBuf, { key: pubKey, dsaEncoding: enc }, sigBuf)) okSig = true;
+        } catch (e) {
+          errCrypto = String((e && e.message) || e).slice(0, 80);
+        }
       }
-    } catch {}
+      if (!okSig && sigBuf.length === 64) {
+        try {
+          if (verify(alg, payloadBuf, pubKey, p1363aDer(sigBuf))) okSig = true;
+        } catch (e) {
+          errCrypto = String((e && e.message) || e).slice(0, 80);
+        }
+      }
+      if (okSig) break;
+    }
   }
-  // Respaldo: convierte r||s a DER a mano (Node viejo que ignora dsaEncoding)
-  if (!okSig && sigBuf.length === 64) {
+  // Último recurso: ECDSA P-256 en JavaScript puro (no depende de OpenSSL/BoringSSL de Electron)
+  if (!okSig) {
     try {
-      okSig = verify("SHA-256", payloadBuf, pubKey, p1363aDer(sigBuf));
-    } catch {}
+      okSig = verificarP256JS(payloadBuf, sigBuf);
+    } catch (e) {
+      errCrypto = errCrypto || String((e && e.message) || e).slice(0, 80);
+    }
   }
   if (!okSig) {
     return {
       ok: false,
       error:
-        `Firma no válida. Huella de la clave de esta app: ${huellaClave()} · Node ${process.versions.node}. Casi siempre: (1) la clave pública de esta app no es la del generador que firmó, o (2) la licencia se pegó cortada.`,
+        `Firma no válida. Huella de la clave de esta app: ${huellaClave()} · Node ${process.versions.node}${errCrypto ? " · " + errCrypto : ""}. Casi siempre: (1) la clave pública de esta app no es la del generador que firmó, o (2) la licencia se pegó cortada.`,
     };
   }
 

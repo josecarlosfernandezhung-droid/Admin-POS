@@ -305,6 +305,7 @@ function pantallaLicencia(lic = {}) {
         <b>Pega la licencia recibida</b>
         <p class="muted" style="margin:4px 0 8px;font-size:.84rem">Es un texto largo. Cópialo completo, sin espacios de más al inicio o al final.</p>
         <textarea id="tokLic" class="lic-token" rows="5" placeholder="Pega aquí la licencia…" spellcheck="false" autocomplete="off"></textarea>
+>
         <p class="error" id="errLic" hidden></p>
         <p class="ok" id="okLic" hidden></p>
       </div>
@@ -337,8 +338,6 @@ function entrarApp() {
     <div class="principal"><div class="barra">
       <div class="marca"><img src="logo.png" alt=""><h2>Admin POS</h2><button class="yo" data-act="menuYo">${e(S.yo.nombre)}</button></div>
       <div class="periodo" id="periodo">${[["hoy", "Hoy"], ["7", "7 días"], ["30", "30 días"], ["90", "90 días"], ["todo", "Todo"], ["custom", "Fechas"]].map(([v, n]) => `<button data-act="periodo" data-v="${v}">${n}</button>`).join("")}
-      </div>
-      <div class="herramientas">
         <button class="btn sec chico" data-act="buscarGlobal" title="Buscar">🔍</button>
         <button class="btn sec chico" data-act="toggleTema" id="btnTema" title="Cambiar tema claro/oscuro">${LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro"}</button>
         <button class="btn sec chico" data-act="prefsUI" title="Preferencias">Aa</button>
@@ -362,7 +361,7 @@ function marcarNav() {
   document.querySelectorAll("[data-act=ir]").forEach((b) => b.classList.toggle("sel", b.dataset.v === S.vista));
   document.querySelectorAll("[data-act=periodo]").forEach((b) => b.classList.toggle("sel", b.dataset.v === S.periodo));
   const p = $("#periodo"); if (p) p.hidden = SIN_PERIODO.includes(S.vista);
-  const rc = $("#rango-custom"); if (rc) rc.hidden = S.periodo !== "custom" || SIN_PERIODO.includes(S.vista);
+  const rc = $("#rango-custom"); if (rc) rc.hidden = S.periodo !== "custom";
   const mb = document.querySelector("#menu .sel"); if (mb) mb.scrollIntoView({ inline: "center", block: "nearest" });
 }
 
@@ -523,7 +522,7 @@ vistas.resumen = async (silencio) => {
   const vc = (v, txt) => (v == null ? `<div class="v muted">${txt}</div>` : `<div class="v ${claseVar(v)}">${v >= 0 ? "▲" : "▼"} ${signo(v)} ${txt}</div>`);
   const maxFam = Math.max(1, ...d.familias.map((f) => f.total));
   const bloqAlertas = alertas?.items?.length
-    ? `<div class="tarjeta"><h3>Alertas al abrir</h3>${alertas.items.map((a) => `<div class="fila alerta-fila"><span class="etiqueta et-${a.nivel === "ok" ? "ok" : a.nivel === "alta" ? "alta" : "media"}">${a.nivel}</span><span class="alerta-txt">${e(a.texto)}</span></div>`).join("")}</div>`
+    ? `<div class="tarjeta"><h3>Alertas al abrir</h3>${alertas.items.map((a) => `<div class="fila"><span class="etiqueta et-${a.nivel === "ok" ? "ok" : a.nivel === "alta" ? "alta" : "media"}">${a.nivel}</span><span style="margin-left:8px">${e(a.texto)}</span></div>`).join("")}</div>`
     : "";
   const bloqPanel = panel && !solo
     ? `<div class="kpis">
@@ -569,16 +568,79 @@ vistas.resumen = async (silencio) => {
       ${tr.horasHoy.length ? `<div style="margin-top:14px"><span class="muted" style="font-size:.82rem">Ventas por hora de ese día</span>${graficaHoras(tr.horasHoy, tr.horasHoy.reduce((m, x) => (!m || x.total > m.total ? x : m), null))}</div>` : ""}</div>
     <div class="tarjeta"><h3>Ritmo del día <small>${pico ? `Pico a las ${pico.hora}:00` : ""}</small></h3>${graficaHoras(d.porHora, pico)}
       <p class="muted" style="margin:10px 0 0;font-size:.84rem">${d.formasPago.map((f) => `${e(f.socio)} ${compacto(f.total)}`).join(" · ")}</p></div>
-    <div class="tarjeta"><h3>Ventas por día <small>${fmt(d.unidades, 0)} unidades</small></h3>${graficaLinea(d.porDia)}</div>
-    <div class="tarjeta"><h3>Promedio por día de la semana</h3>${graficaDiaSemana(d.porDia)}<p class="muted" style="margin:8px 0 0;font-size:.84rem">Promedio de ventas de cada día de la semana en el período seleccionado.</p></div>
-    <div class="tarjeta"><h3>Lo más vendido</h3><div class="scroll"><table><tr><th>Artículo</th><th>Familia</th><th class="d">Unid.</th><th class="d">Importe</th></tr>
-      ${d.top.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.familia)}</td><td class="d num">${fmt(x.unidades, 0)}</td><td class="d num">${compacto(x.total)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">Sin ventas en este período</td></tr>'}</table></div></div>
+    <div class="tarjeta">
+      <h3>Resumen financiero <small>${diaLargo(d.desde)} – ${diaLargo(d.hasta)}</small></h3>
+      <div class="scroll"><table class="tabla-resumen">
+        <tr><td>Ventas brutas</td><td class="d num"><b>${cup(d.total)}</b></td></tr>
+        <tr><td>Devoluciones</td><td class="d num">${cup(d.devoluciones || 0)}</td></tr>
+        <tr><td><b>Total limpio</b></td><td class="d num"><b>${cup(d.totalLimpio != null ? d.totalLimpio : (d.total - (d.devoluciones || 0)))}</b></td></tr>
+        <tr><td>Descuentos (importe)</td><td class="d num">${cup(d.descuentos || 0)}</td></tr>
+        <tr><td>Costo de lo vendido</td><td class="d num">${cup(d.costo || 0)}</td></tr>
+        <tr><td><b>Ganancia</b></td><td class="d num"><b>${cup(d.ganancia || 0)}</b></td></tr>
+        <tr><td>Margen</td><td class="d num">${fmt((d.margen || 0) * 100, 1)} %</td></tr>
+        <tr><td>Tickets</td><td class="d num">${fmt(d.tickets, 0)} · ticket medio ${cup(d.promedio)}</td></tr>
+        <tr><td>Pago en efectivo (turnos)</td><td class="d num">${cup(d.pagoEfectivo || 0)}</td></tr>
+        <tr><td>Otros pagos</td><td class="d num">${cup(d.pagoOtros || 0)}</td></tr>
+      </table></div>
+      <p class="muted" style="margin:8px 0 0;font-size:.82rem">Si el costo sale 0, completa PriceIn en AxisPOS o el % estimado en Ajustes.</p>
+    </div>
+
+    <div class="tarjeta"><h3>Ventas por día</h3>
+      ${graficaLinea(d.porDia)}
+      <div class="scroll" style="margin-top:12px"><table>
+        <tr><th>Día</th><th class="d">Tickets</th><th class="d">Unidades</th><th class="d">Ticket medio</th><th class="d">Ventas</th></tr>
+        ${(d.porDia || []).map((x) => `<tr>
+          <td>${diaLargo(x.dia)}</td>
+          <td class="d num">${fmt(x.tickets, 0)}</td>
+          <td class="d num">${fmt(x.unidades || 0, 0)}</td>
+          <td class="d num">${cup(x.promedio || (x.tickets ? x.total / x.tickets : 0))}</td>
+          <td class="d num"><b>${cup(x.total)}</b></td>
+        </tr>`).join("") || '<tr><td colspan="5" class="muted">Sin ventas en el período</td></tr>'}
+        <tr><td><b>Total</b></td><td class="d num"><b>${fmt(d.tickets, 0)}</b></td><td class="d num"><b>${fmt(d.unidades, 0)}</b></td><td class="d num"><b>${cup(d.promedio)}</b></td><td class="d num"><b>${cup(d.total)}</b></td></tr>
+      </table></div>
+    </div>
+
+    <div class="tarjeta"><h3>Promedio por día de la semana</h3>${graficaDiaSemana(d.porDia)}
+      <p class="muted" style="margin:8px 0 0;font-size:.84rem">Promedio de ventas de cada día de la semana en el período.</p></div>
+
+    ${solo ? "" : `<div class="tarjeta"><h3>Ventas por trabajador</h3>
+      <div class="scroll"><table><tr><th>Trabajador</th><th class="d">Tickets</th><th class="d">Ventas</th></tr>
+      ${(d.cajeros || []).map((c) => `<tr>
+        <td>${e(c.nombre)}<small>${ROL[c.rol] || ""}${c.devoluciones ? " · dev. " + compacto(c.devoluciones) : ""}</small></td>
+        <td class="d num">${fmt(c.tickets, 0)}</td>
+        <td class="d num"><b>${compacto(c.total)}</b></td>
+      </tr>`).join("") || '<tr><td colspan="3" class="muted">Sin datos</td></tr>'}
+      </table></div></div>`}
+
+    <div class="tarjeta"><h3>Ventas por producto <small>estilo AxisPOS</small></h3>
+      <div class="scroll"><table>
+        <tr><th>Grupo</th><th>Código</th><th>Nombre</th><th class="d">Cant.</th><th class="d">$ Venta</th><th class="d">$ Costo</th><th class="d">Ganancia</th><th class="d">% marg.</th></tr>
+        ${(d.top || []).map((x) => `<tr>
+          <td class="muted">${e(x.familia)}</td>
+          <td class="num">${e(x.codigo || "—")}</td>
+          <td>${e(x.nombre)}</td>
+          <td class="d num">${fmt(x.unidades, 1)}</td>
+          <td class="d num">${compacto(x.total)}</td>
+          <td class="d num">${compacto(x.costo || 0)}</td>
+          <td class="d num">${compacto(x.ganancia != null ? x.ganancia : (x.total - (x.costo || 0)))}</td>
+          <td class="d num">${fmt((x.margen != null ? x.margen : (x.total ? (x.total - (x.costo || 0)) / x.total : 0)) * 100, 1)} %</td>
+        </tr>`).join("") || '<tr><td colspan="8" class="muted">Sin ventas</td></tr>'}
+      </table></div></div>
+
     <div class="tarjeta"><h3>Venta por grupo / familia</h3>
       ${d.familias.map((f) => hbar(f.familia, f.total, maxFam, compacto(f.total))).join("") || '<p class="muted">Sin datos</p>'}
-      <div class="scroll" style="margin-top:12px"><table><tr><th>Grupo</th><th class="d">Unid.</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">%</th><th class="d">Ventas</th></tr>
-      ${d.familias.map((f) => `<tr><td>${e(f.familia)}</td><td class="d num">${fmt(f.unidades || 0, 0)}</td><td class="d num">${compacto(f.costo || 0)}</td><td class="d num">${compacto(f.ganancia || 0)}</td><td class="d num">${fmt((f.parte || 0) * 100, 1)} %</td><td class="d num"><b>${compacto(f.total)}</b></td></tr>`).join("")}
+      <div class="scroll" style="margin-top:12px"><table>
+        <tr><th>Grupo</th><th class="d">Unid.</th><th class="d">$ Venta</th><th class="d">$ Costo</th><th class="d">Ganancia</th><th class="d">% del total</th></tr>
+        ${d.familias.map((f) => `<tr>
+          <td>${e(f.familia)}</td>
+          <td class="d num">${fmt(f.unidades || 0, 0)}</td>
+          <td class="d num"><b>${compacto(f.total)}</b></td>
+          <td class="d num">${compacto(f.costo || 0)}</td>
+          <td class="d num">${compacto(f.ganancia || 0)}</td>
+          <td class="d num">${fmt((f.parte || 0) * 100, 1)} %</td>
+        </tr>`).join("")}
       </table></div></div>
-    ${solo ? "" : `<div class="tarjeta"><h3>Ventas por trabajador</h3>${d.cajeros.map((c) => `<div class="fila"><div>${e(c.nombre)}<small>${ROL[c.rol] || ""} · ${fmt(c.tickets, 0)} tickets${c.devoluciones ? ` · dev. ${compacto(c.devoluciones)}` : ""}</small></div><div class="d num"><b>${compacto(c.total)}</b></div></div>`).join("") || '<p class="muted">Sin datos</p>'}</div>`}
+
     <div class="tarjeta"><h3>Últimos tickets <small><button class="link" data-act="ir" data-v="ventas">Ver todos</button></small></h3>
       ${d.recientes.map((t) => `<div class="fila clic" data-act="ticket" data-acct="${t.acct}" style="cursor:pointer"><div><span class="link">${t.ticket}</span><small>${fechaHora(t.fecha)} · ${e(t.cajero || "")}</small></div><div class="d num">${cup(t.total)}</div></div>`).join("") || '<p class="muted">Sin tickets</p>'}</div>`;
   // Montar gráficas interactivas (Chart.js)
@@ -754,50 +816,67 @@ vistas.caja = async () => {
   const d = await get("/api/caja", paramsPeriodo({ pagina: S.cajaPag }));
   if (!aqui(tk)) return;
   S.pagCb = (n) => { S.cajaPag = n; vista(true); };
+  // DiffClose Axis = esperado − contado → >0 faltante, <0 sobrante
   const etDif = (t) => {
+    if (t.sinContar) return '<span class="etiqueta et-media">Sin contar</span>';
     if (t.diferencia == null) return '<span class="etiqueta et-gris">Sin cierre</span>';
-    const txt = `${t.diferencia > 0 ? "+" : ""}${fmt(t.diferencia, 0)}`;
-    if (t.nivel === "ok") return `<span class="etiqueta et-ok">OK ${txt}</span>`;
-    return `<span class="etiqueta et-${t.nivel === "alta" ? "alta" : "media"}">${txt}</span>`;
+    const v = t.diferencia;
+    if (Math.abs(v) <= (d.tolerancia || 0)) return `<span class="etiqueta et-ok">OK ${v > 0 ? "+" : ""}${fmt(v, 0)}</span>`;
+    if (v > 0) return `<span class="etiqueta et-${t.nivel === "alta" ? "alta" : "media"}">Faltante ${fmt(v, 0)}</span>`;
+    return `<span class="etiqueta et-${t.nivel === "alta" ? "alta" : "media"}">Sobrante ${fmt(Math.abs(v), 0)}</span>`;
   };
-  const etPagos = (t) => {
-    if (!(t.ventas > 0)) return "—";
-    if (Math.abs(t.difPagos) <= 1) return '<span class="muted" style="font-size:.82rem">Pagos OK</span>';
-    return `<span class="etiqueta et-media">Δ ${fmt(t.difPagos, 0)}</span>`;
-  };
-  $("#contenido").innerHTML = `${cab("Caja", "Conciliación de cada turno: lo contado al cierre vs lo que el sistema esperaba.")}
-    <div class="kpis"><div class="kpi"><span>Ventas</span><b class="num">${cup(d.ventas)}</b></div><div class="kpi"><span>Devoluciones</span><b class="num">${cup(d.devoluciones)}</b></div><div class="kpi"><span>Neto</span><b class="num">${cup(d.neto)}</b></div>
-      <div class="kpi"><span>Turnos</span><b class="num">${d.turnos}</b><small>${d.conDiferencia} fuera de tolerancia (${fmt(d.tolerancia, 0)} CUP)</small></div></div>
-    <div class="tarjeta"><h3>Cómo leer las columnas</h3>
+  const netoComunal = Math.round(((d.faltante || 0) - (d.sobrante || 0)) * 100) / 100;
+  $("#contenido").innerHTML = `${cab("Caja", "Faltantes, sobrantes y resumen comunal del efectivo por turno.")}
+    <div class="kpis">
+      <div class="kpi"><span>Faltante (período)</span><b class="num" style="color:var(--rojo)">${cup(d.faltante || 0)}</b><small>contó de menos vs libro</small></div>
+      <div class="kpi"><span>Sobrante (período)</span><b class="num" style="color:var(--verde)">${cup(d.sobrante || 0)}</b><small>contó de más vs libro</small></div>
+      <div class="kpi"><span>Neto comunal</span><b class="num" style="color:${netoComunal > 0 ? "var(--rojo)" : netoComunal < 0 ? "var(--verde)" : "inherit"}">${cup(netoComunal)}</b><small>faltantes − sobrantes (lo que asume el negocio)</small></div>
+      <div class="kpi"><span>Turnos</span><b class="num">${d.turnos}</b><small>${d.conDiferencia || 0} fuera tol. (${fmt(d.tolerancia, 0)}) · ${fmt(d.cerradosSinContar || 0, 0)} sin contar</small></div>
+    </div>
+    <div class="tarjeta"><h3>Qué significa cada cosa</h3>
       <p class="muted" style="margin:0;font-size:.86rem">
-        <b>Esperado</b> = fondo inicial + ventas − devoluciones − retiros.<br>
-        <b>Diferencia (efectivo)</b> = contado − esperado. Negativo = faltante, positivo = sobrante. Solo es <b>OK</b> si |diferencia| ≤ tolerancia (${fmt(d.tolerancia, 0)} CUP en Ajustes).<br>
-        <b>Pagos vs ventas</b> es otra cosa: compara el total de ventas del turno con los pagos registrados (efectivo/tarjeta/transferencia). «Pagos OK» no significa que el efectivo del cajón cuadre.
+        <b>Faltante</b>: al cerrar había <i>menos</i> efectivo del que el libro de caja esperaba (DiffClose &gt; 0).<br>
+        <b>Sobrante</b>: había <i>más</i> efectivo del esperado (DiffClose &lt; 0).<br>
+        <b>Neto comunal</b>: suma de faltantes menos sobrantes del período; es la pérdida o ganancia de efectivo que “queda en el negocio” entre todos los turnos.<br>
+        <b>Esperado</b> = fondo + libro de caja del turno − retiros (igual que AxisPOS). Tolerancia: ${fmt(d.tolerancia, 0)} CUP (Ajustes).
       </p></div>
-    ${d.conDiferencia ? `<div class="tarjeta"><h3>Auditoría de cierres (efectivo)</h3><div class="rt"><div><span>Faltante acumulado</span><b class="num" style="color:var(--rojo)">${cup(d.faltante)}</b></div><div><span>Sobrante acumulado</span><b class="num" style="color:var(--verde)">${cup(d.sobrante)}</b></div><div><span>Turnos con pagos ≠ ventas</span><b class="num">${d.sinCuadrar}</b></div></div></div>` : ""}
-    ${(d.porCajero && d.porCajero.length) ? `<div class="tarjeta"><h3>Histórico de diferencias por cajero (efectivo)</h3>
-      <div class="scroll"><table><tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Fuera tol.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto</th><th class="d">Máx. faltante</th></tr>
-      ${d.porCajero.map((c) => `<tr><td>${e(c.usuario)}</td><td class="d num">${c.turnos}</td><td class="d num">${c.conDif}</td>
-        <td class="d num" style="color:${c.faltante < 0 ? "var(--rojo)" : "inherit"}">${c.faltante ? cup(c.faltante) : "—"}</td>
-        <td class="d num" style="color:${c.sobrante > 0 ? "var(--verde)" : "inherit"}">${c.sobrante ? cup(c.sobrante) : "—"}</td>
-        <td class="d num">${cup(c.totalDif)}</td>
-        <td class="d num">${c.maxFaltante < 0 ? cup(c.maxFaltante) : "—"}</td></tr>`).join("")}</table></div></div>` : ""}
-    <div class="tarjeta"><h3>Cobros por forma de pago</h3>${d.formasPago.map((f) => `<div class="fila"><div>${e(f.socio)}<small>${fmt(f.tickets, 0)} tickets</small></div><div class="d num">${cup(f.total)}</div></div>`).join("") || '<p class="muted">Sin datos</p>'}</div>
-    <div class="tarjeta"><h3>Turnos</h3>
-      <div class="scroll"><table><tr><th>Apertura</th><th>Quién</th><th class="d">Ventas</th><th class="d">Efectivo</th><th class="d">Tarjeta</th><th class="d">Transfer.</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Dif. efectivo</th><th class="d">Horas</th></tr>
-      ${d.filas.map((t) => `<tr>
-        <td class="num">${fechaHora(t.apertura)}<small>${fechaHora(t.cierre)}</small></td>
-        <td>${e(t.usuario || "")}<small>${e(t.local || "")}</small></td>
-        <td class="d num">${cup(t.ventas)}</td>
-        <td class="d num">${t.efectivo ? cup(t.efectivo) : "—"}</td>
-        <td class="d num">${t.tarjeta ? cup(t.tarjeta) : "—"}</td>
-        <td class="d num">${t.transferencia ? cup(t.transferencia) : "—"}</td>
-        <td class="d num">${t.contado ? cup(t.esperado) : "—"}</td>
-        <td class="d num">${t.contado ? cup(t.contado) : "—"}</td>
-        <td class="d">${etDif(t)}</td>
-        <td class="d num">${t.horasTurno != null ? fmt(t.horasTurno, 1) + " h" : "—"}</td>
-      </tr>`).join("") || '<tr><td colspan="10" class="muted">Sin turnos en el período</td></tr>'}</table></div>${pager(d.pagina, d.paginas)}</div>`;
+    ${(d.porCajero && d.porCajero.length) ? `<div class="tarjeta"><h3>Faltantes y sobrantes por cajero</h3>
+      <div class="scroll"><table>
+        <tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Fuera tol.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto comunal</th><th class="d">Máx. faltante</th><th class="d">Máx. sobrante</th><th class="d">Sin contar</th></tr>
+        ${d.porCajero.map((c) => {
+          const neto = (c.faltante || 0) - (c.sobrante || 0);
+          return `<tr>
+            <td>${e(c.usuario)}</td>
+            <td class="d num">${c.turnos}</td>
+            <td class="d num">${c.conDif}</td>
+            <td class="d num" style="color:var(--rojo)">${c.faltante ? cup(c.faltante) : "—"}</td>
+            <td class="d num" style="color:var(--verde)">${c.sobrante ? cup(c.sobrante) : "—"}</td>
+            <td class="d num" style="color:${neto > 0 ? "var(--rojo)" : neto < 0 ? "var(--verde)" : "inherit"}"><b>${cup(neto)}</b></td>
+            <td class="d num">${c.maxFaltante ? cup(c.maxFaltante) : "—"}</td>
+            <td class="d num">${c.maxSobrante ? cup(c.maxSobrante) : "—"}</td>
+            <td class="d num">${c.sinContar || "—"}</td>
+          </tr>`;
+        }).join("")}
+      </table></div>
+      <p class="muted" style="margin:8px 0 0;font-size:.82rem">El neto comunal por cajero ayuda a ver quién aporta más faltante o sobrante al total del negocio.</p>
+    </div>` : ""}
+    <div class="tarjeta"><h3>Turnos del período</h3>
+      <div class="scroll"><table>
+        <tr><th>Apertura</th><th>Quién</th><th class="d">Ventas</th><th class="d">Libro caja</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Resultado</th><th>Estado</th><th class="d">Horas</th></tr>
+        ${d.filas.map((t) => `<tr>
+          <td class="num">${fechaHora(t.apertura)}<small>${fechaHora(t.cierre)}</small></td>
+          <td>${e(t.usuario || "")}<small>${e(t.local || "")}</small></td>
+          <td class="d num">${cup(t.ventas)}</td>
+          <td class="d num">${t.libroCaja != null ? cup(t.libroCaja) : "—"}</td>
+          <td class="d num">${cup(t.esperado)}</td>
+          <td class="d num">${t.sinContar ? "—" : cup(t.contado)}</td>
+          <td class="d">${etDif(t)}</td>
+          <td><small>${e(t.estadoCierre || "")}</small></td>
+          <td class="d num">${t.horasTurno != null ? fmt(t.horasTurno, 1) + " h" : "—"}</td>
+        </tr>`).join("") || '<tr><td colspan="9" class="muted">Sin turnos en el período</td></tr>'}
+      </table></div>${pager(d.pagina, d.paginas)}</div>`;
 };
+
 
 vistas.equipo = async () => {
   const tk = S.tk;
@@ -893,12 +972,12 @@ vistas.inventario = async () => {
         <select data-in="localExis"><option value="">Todos los locales</option>${d.locales.map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.local) ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}</select>
         <button class="btn sec" data-act="invSub" data-v="ipv">Aplicar</button>
         <button class="btn sec" data-act="printVista">Imprimir / PDF</button></div>
-        <p class="muted" style="margin:0 0 8px;font-size:.84rem">Período ${diaLargo(d.desde)} – ${diaLargo(d.hasta)}. Inicial = stock actual − movimientos del período (reconstruido desde AxisPOS).</p>
+        <p class="muted" style="margin:0 0 8px;font-size:.84rem">Período ${diaLargo(d.desde)} – ${diaLargo(d.hasta)}. Escribe el producto y pulsa <b>Aplicar</b> (no filtra letra a letra). Toca una fila para ver el historial detallado. Inicial = stock actual − movimientos del período.</p>
         <h3>Movimiento de mercancías por producto</h3>
         <div class="scroll"><table>
           <tr><th>Producto</th><th class="d">Inicio</th><th class="d">Entradas</th><th class="d">Ventas</th><th class="d">Dev.</th><th class="d">Mermas</th><th class="d">Final</th><th class="d">\$ ventas</th></tr>
-          ${d.filas.map((x) => `<tr>
-            <td>${e(x.nombre)}<small>${e(x.familia)}${x.codigo ? " · " + e(x.codigo) : ""}</small></td>
+          ${d.filas.map((x) => `<tr class="click" data-act="histMerc" data-id="${x.id}" title="Ver historial de mercancía">
+            <td>${e(x.nombre)}<small>${e(x.familia)}${x.codigo ? " · " + e(x.codigo) : ""} · tocar para historial</small></td>
             <td class="d num">${fmt(x.inicio, 1)}</td>
             <td class="d num">${x.entradas ? fmt(x.entradas, 1) : "—"}</td>
             <td class="d num">${x.ventas ? fmt(x.ventas, 1) : "—"}</td>
@@ -906,7 +985,7 @@ vistas.inventario = async () => {
             <td class="d num">${x.mermas ? fmt(x.mermas, 1) : "—"}</td>
             <td class="d num"><b>${fmt(x.final, 1)}</b></td>
             <td class="d num">${x.importeVentas ? compacto(x.importeVentas) : "—"}</td>
-          </tr>`).join("") || '<tr><td colspan="8" class="muted">Sin movimientos ni stock en el filtro</td></tr>'}
+          </tr>`).join("") || '<tr><td colspan="8" class="muted">Sin movimientos ni stock en el filtro. Escribe el nombre y pulsa Aplicar.</td></tr>'}
         </table></div></div>
       <div class="tarjeta"><h3>Tipos de movimiento en el período</h3>
         <div class="scroll"><table><tr><th>Tipo</th><th class="d">Operaciones</th><th class="d">Unidades</th><th class="d">Importe</th></tr>
@@ -948,12 +1027,52 @@ vistas.inventario = async () => {
         </tr>`).join("") || '<tr><td colspan="7" class="muted">Nada que mover: el PV cumple mínimo y cobertura, o no hay stock en almacén.</td></tr>'}
         </table></div></div>`;
   } else if (S.invSub === "hechos") {
-    const d = await get("/api/traspasos-hechos", paramsPeriodo());
-    cuerpo = `<div class="kpis"><div class="kpi"><span>Movimientos</span><b class="num">${fmt(d.movimientos, 0)}</b></div><div class="kpi"><span>Unidades</span><b class="num">${fmt(d.unidades, 0)}</b></div></div>
-      <div class="tarjeta"><h3>Historial de traspasos (AxisPOS)</h3>
-        <div class="scroll"><table><tr><th>Cuándo</th><th>Tipo</th><th>Producto</th><th class="d">Cant.</th><th>Usuario</th><th>Local</th></tr>
-        ${d.filas.map((x) => `<tr><td class="num">${fechaHora(x.fecha)}</td><td>${e(x.nombreTipo)}</td><td>${e(x.nombre)}</td><td class="d num">${fmt(x.cant, 1)}</td><td>${e(x.usuario || "")}</td><td class="muted">${e(x.local)}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Sin traspasos registrados en el período (OperType 7/26/27).</td></tr>'}
-        </table></div></div>`;
+    const d = await get("/api/traspasos-hechos", paramsPeriodo({
+      q: S.exis.q || "",
+      origen: S.exis.origen || "",
+      destino: S.exis.destino || "",
+    }));
+    cuerpo = `<div class="kpis">
+        <div class="kpi"><span>Líneas de traspaso</span><b class="num">${fmt(d.movimientos, 0)}</b></div>
+        <div class="kpi"><span>Unidades movidas</span><b class="num">${fmt(d.unidades, 0)}</b></div>
+        <div class="kpi"><span>Valor costo</span><b class="num">${cup(d.valorCosto)}</b></div>
+        <div class="kpi"><span>Rutas distintas</span><b class="num">${fmt((d.rutas || []).length, 0)}</b></div>
+      </div>
+      <div class="tarjeta"><div class="filtros">
+        <input type="search" placeholder="Producto o código" value="${e(S.exis.q || "")}" data-in="buscaExis">
+        <select data-in="origenTr">
+          <option value="">Desde: todos</option>
+          ${(d.locales || []).map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.origen || "") ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}
+        </select>
+        <select data-in="destinoTr">
+          <option value="">Hacia: todos</option>
+          ${(d.locales || []).map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.destino || "") ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}
+        </select>
+        <button class="btn sec" data-act="invSub" data-v="hechos">Aplicar</button>
+      </div>
+      <p class="muted" style="margin:8px 0 0;font-size:.84rem">Como en AxisPOS: origen → destino, cantidad y costo. Período ${diaLargo(d.desde)} – ${diaLargo(d.hasta)}.</p></div>
+      ${(d.rutas || []).length ? `<div class="tarjeta"><h3>Resumen por ruta</h3>
+        <div class="scroll"><table><tr><th>Desde</th><th>Hasta</th><th class="d">Líneas</th><th class="d">Unidades</th><th class="d">Valor costo</th></tr>
+        ${d.rutas.map((r) => `<tr><td>${e(r.desde)}</td><td>${e(r.hasta)}</td><td class="d num">${fmt(r.n, 0)}</td><td class="d num">${fmt(r.unidades, 1)}</td><td class="d num">${cup(r.valor)}</td></tr>`).join("")}
+        </table></div></div>` : ""}
+      <div class="tarjeta"><h3>Transferencias detalladas</h3>
+        <div class="scroll"><table>
+          <tr><th>Fecha</th><th>Desde</th><th>Hasta</th><th>Producto</th><th class="d">Cant.</th><th class="d">Costo u.</th><th class="d">Valor</th><th>Usuario</th></tr>
+          ${(d.filas || []).map((x) => `<tr>
+            <td class="num">${fechaHora(x.fecha)}</td>
+            <td>${e(x.desde)}</td>
+            <td>${e(x.hasta)}</td>
+            <td>${e(x.nombre)}<small>${e(x.codigo || "")}${x.nota ? " · " + e(x.nota) : ""}</small></td>
+            <td class="d num"><b>${fmt(x.cant, 1)}</b></td>
+            <td class="d num">${x.costoUnit ? cup(x.costoUnit) : "—"}</td>
+            <td class="d num">${x.valorCosto ? cup(x.valorCosto) : "—"}</td>
+            <td class="muted">${e(x.usuario || "")}</td>
+          </tr>`).join("") || '<tr><td colspan="8" class="muted">Sin traspasos en el período (o no hay OperType 7/8/26/27 en la base). Prueba ampliar fechas.</td></tr>'}
+        </table></div></div>
+      ${(d.porProducto || []).length ? `<div class="tarjeta"><h3>Top productos traspasados</h3>
+        <div class="scroll"><table><tr><th>Producto</th><th class="d">Veces</th><th class="d">Unidades</th><th class="d">Valor</th></tr>
+        ${d.porProducto.map((x) => `<tr><td>${e(x.nombre)}<small>${e(x.codigo || "")}</small></td><td class="d num">${fmt(x.n, 0)}</td><td class="d num">${fmt(x.cant, 1)}</td><td class="d num">${cup(x.valor)}</td></tr>`).join("")}
+        </table></div></div>` : ""}`;
   } else if (S.invSub === "antiguedad") {
     const d = await get("/api/antiguedad", paramsPeriodo());
     const r = d.resumen;
@@ -1007,7 +1126,7 @@ vistas.inventario = async () => {
 };
 
 // ---------- Pérdidas ----------
-const TIPOS_EV = [["cancel", "Cancelaciones"], ["anular", "Anulaciones"], ["elim", "Líneas quitadas"], ["desc", "Descuentos"], ["login", "Accesos fallidos"], ["cajon", "Cajón abierto"]];
+const TIPOS_EV = [["cancel", "Cancelaciones"], ["anular", "Anulaciones"], ["elim", "Líneas quitadas"], ["desc", "Descuentos"], ["precio", "Cambios de precio"], ["cierre", "Cierres de caja"], ["login", "Accesos fallidos"], ["cajon", "Cajón abierto"], ["todo", "Todos los logs"]];
 vistas.perdidas = async () => {
   const tk = S.tk;
   const tabs = subTabs([["auditoria", "Auditoría"], ["alertas", "Alertas"], ["mermas", "Mermas"], ["devoluciones", "Devoluciones"], ["patrones", "Patrones anulación"], ["eventos", "Eventos"]], S.perSub, "perSub");
@@ -1054,7 +1173,30 @@ vistas.perdidas = async () => {
         ${d.fueraHorario.map((x) => `<div class="fila"><div>${x.hora}:00 h</div><div class="d num">${fmt(x.tickets, 0)} tickets · ${cup(x.total)}</div></div>`).join("")}</div>` : ""}
       <div class="tarjeta"><h3>Quién más cancela / anula</h3>
         ${d.topCanceladores.map((x) => `<div class="fila"><div>${e(x.nombre)}</div><div class="d num">${fmt(x.n, 0)}</div></div>`).join("") || '<p class="muted">Sin cancelaciones</p>'}
-        <p style="margin:10px 0 0"><button class="link" data-act="perSub" data-v="eventos">Ver eventos detallados</button> · <button class="link" data-act="ir" data-v="caja">Ir a Caja</button></p>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><span>Cambios precio</span><b class="num">${fmt(d.contadores?.cambiosPrecio || 0, 0)}</b></div>
+        <div class="kpi"><span>Anulaciones</span><b class="num">${fmt(d.contadores?.anulaciones || 0, 0)}</b></div>
+        <div class="kpi"><span>Cancelaciones</span><b class="num">${fmt(d.contadores?.cancelaciones || 0, 0)}</b></div>
+        <div class="kpi"><span>Devoluciones</span><b class="num">${fmt(d.contadores?.devoluciones || 0, 0)}</b></div>
+      </div>
+      <div class="tarjeta"><h3>Cambios de precio (log AxisPOS)</h3>
+        ${(d.cambiosPrecio || []).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("") || '<p class="muted">Sin cambios de precio en el período</p>'}
+      </div>
+      <div class="tarjeta"><h3>Anulaciones de venta</h3>
+        ${(d.anulaciones || []).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("") || '<p class="muted">Sin anulaciones</p>'}
+      </div>
+      <div class="tarjeta"><h3>Cancelaciones de operación</h3>
+        ${(d.cancelaciones || []).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("") || '<p class="muted">Sin cancelaciones</p>'}
+      </div>
+      <div class="tarjeta"><h3>Devoluciones (documentos)</h3>
+        <div class="scroll"><table><tr><th>Cuándo</th><th>Ticket</th><th>Cajero</th><th class="d">Líneas</th><th class="d">Total</th></tr>
+        ${(d.devolucionesDetalle || []).map((x) => `<tr class="clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer">
+          <td class="num">${fechaHora(x.fecha)}</td><td class="link num">${x.ticket}</td><td>${e(x.cajero)}</td>
+          <td class="d num">${x.lineas}</td><td class="d num">${cup(x.total)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Sin devoluciones</td></tr>'}
+        </table></div>
+        <p style="margin:10px 0 0"><button class="link" data-act="perSub" data-v="eventos">Ver todos los eventos</button> · <button class="link" data-act="ir" data-v="caja">Ir a Caja</button></p>
+        <p class="muted" style="font-size:.82rem;margin:8px 0 0">${e(d.notaCaja || "")}</p>
       </div>`;
   } else if (S.perSub === "alertas") {
     const d = await get("/api/anomalias", paramsPeriodo());
@@ -1126,10 +1268,6 @@ vistas.ajustes = async () => {
       ${campo("horasTurnoMax", "Horas máximas de un turno", "Ej. 12")}${campo("metaDiaria", "Meta diaria de ventas (CUP)", "0 = sin meta")}
       ${campo("costoEstimadoPct", "Costo estimado si falta (%)", "Ej. 10 → costo = precio de venta − 10 %. Para IPV, inversión y márgenes.")}</div>
       <p class="error" id="err-aj" hidden></p><button class="btn">Guardar ajustes</button></form>
-    <form class="tarjeta" id="form-alm"><h3>Almacenes visibles</h3><p class="muted" style="margin:-4px 0 8px;font-size:.86rem">Marca los almacenes que quieres ver en Existencias, Inventario, IPV y Traspasos. Los desmarcados se ocultan de esas pantallas (los datos no se borran).</p>
-      ${(d.almacenes || []).map((x) => `<label class="fila alm-fila"><input type="checkbox" name="alm" value="${x.id}" ${(a.almacenesOcultos || []).includes(x.id) ? "" : "checked"}><span class="alm-nombre">${e(x.nombre)}<small>${fmt(x.productos, 0)} productos · ${fmt(x.piezas, 0)} piezas</small></span></label>`).join("") || '<p class="muted">No se encontraron almacenes.</p>'}
-      <div class="alm-btns"><button type="button" class="btn sec chico" data-act="almTodos" data-v="1">Marcar todos</button><button type="button" class="btn sec chico" data-act="almTodos" data-v="0">Desmarcar todos</button></div>
-      <p class="error" id="err-alm" hidden></p><button class="btn">Guardar almacenes</button></form>
     <form class="tarjeta" id="form-db2"><h3>Conexión con MariaDB</h3>${d.db.permisos === "escritura" ? '<div class="aviso-caja">Este usuario de MariaDB puede modificar datos. Es más seguro usar uno de solo lectura (SELECT).</div>' : ""}
       <div class="filtros" style="margin-top:10px"><label class="campo">Servidor<input name="host" value="${e(d.db.host)}"></label><label class="campo">Puerto<input name="puerto" value="${d.db.puerto}"></label><label class="campo">Base de datos<input name="base" value="${e(d.db.base)}"></label>
       <label class="campo">Usuario<input name="usuario" value="${e(d.db.usuario)}" autocapitalize="none"></label><label class="campo">Contraseña (vacía = no cambiar)<input name="clave" type="password" autocomplete="off"></label></div>
@@ -1139,13 +1277,6 @@ vistas.ajustes = async () => {
     const v = Object.fromEntries(new FormData(ev.target));
     for (const k in v) v[k] = Number(String(v[k]).replace(",", "."));
     try { await post("/api/ajustes/params", v); aviso("Ajustes guardados"); } catch (err) { const x = $("#err-aj"); x.textContent = err.message; x.hidden = false; }
-  };
-  $("#form-alm").onsubmit = async (ev) => {
-    ev.preventDefault();
-    const todos = [...ev.target.querySelectorAll("input[name=alm]")];
-    const ocultos = todos.filter((i) => !i.checked).map((i) => Number(i.value));
-    if (todos.length && ocultos.length === todos.length) { const x = $("#err-alm"); x.textContent = "Deja al menos un almacén visible."; x.hidden = false; return; }
-    try { await post("/api/ajustes/almacenes", { ocultos }); aviso("Almacenes guardados"); } catch (err) { const x = $("#err-alm"); x.textContent = err.message; x.hidden = false; }
   };
   $("#form-db2").onsubmit = async (ev) => {
     ev.preventDefault();
@@ -1426,9 +1557,6 @@ const ACC = {
       aviso("Código seleccionado · copia con Ctrl+C");
     }
   },
-  almTodos: (el) => {
-    document.querySelectorAll("#form-alm input[name=alm]").forEach((i) => { i.checked = el.dataset.v === "1"; });
-  },
   activarLic: async () => {
     const token = ($("#tokLic")?.value || "").trim();
     const err = $("#errLic");
@@ -1470,7 +1598,19 @@ const ACC = {
   menuYo: () => abrirModal(`<div class="dialogo"><h3>${e(S.yo.nombre)}</h3>${etRol(S.yo.rol)}<button class="btn sec" data-act="cambiarMiPin">Cambiar mi PIN</button><button class="btn" data-act="salir">Salir</button></div>`),
   cambiarMiPin: () => { cerrarModal(); cambiarMiPin(); },
   salir: () => { cerrarModal(); salir(); },
-  invSub: (el) => { S.invSub = el.dataset.v; vista(); },
+  invSub: (el) => {
+    // Al aplicar filtros de inventario, lee el texto del buscador sin repintar antes
+    const qEl = document.querySelector('[data-in="buscaExis"]');
+    if (qEl) S.exis.q = qEl.value;
+    const lEl = document.querySelector('[data-in="localExis"]');
+    if (lEl) S.exis.local = lEl.value;
+    const oEl = document.querySelector('[data-in="origenTr"]');
+    if (oEl) S.exis.origen = oEl.value;
+    const dEl = document.querySelector('[data-in="destinoTr"]');
+    if (dEl) S.exis.destino = dEl.value;
+    S.invSub = el.dataset.v || S.invSub;
+    vista(true);
+  },
   abcClase: (el) => { S.abcClase = el.dataset.v; vista(true); },
   perSub: (el) => { S.perSub = el.dataset.v; vista(); },
   ventasSub: (el) => { S.ventas.sub = el.dataset.v; S.ventas.pagina = 1; vista(); },
@@ -1537,6 +1677,40 @@ const ACC = {
       S.fisicoCsv = r.filas;
     } catch (err) { aviso(err.message || "No se pudo leer el archivo"); }
   },
+  histMerc: async (el) => {
+    const id = el.dataset.id;
+    if (!id) return;
+    abrirModal(`<div class="dialogo"><p class="cargando">Cargando historial…</p></div>`);
+    try {
+      const d = await get("/api/historial-mercancia", paramsPeriodo({ id }));
+      const p = d.producto || {};
+      const filas = (d.filas || []).map((x) => `<tr>
+        <td>${e(x.fecha)}<small>${e(x.usuario)}${x.local ? " · " + e(x.local) : ""}</small></td>
+        <td>${e(x.operacion)}${x.ticket ? `<small>#${x.ticket}</small>` : ""}</td>
+        <td class="d num">${x.entrada ? fmt(x.entrada, 2) : ""}</td>
+        <td class="d num">${x.salida ? fmt(x.salida, 2) : ""}</td>
+        <td class="d num"><b>${fmt(x.final, 2)}</b></td>
+        <td class="d num">${x.importe ? compacto(x.importe) : "—"}</td>
+      </tr>`).join("") || '<tr><td colspan="6" class="muted">Sin movimientos en el período</td></tr>';
+      abrirModal(`<div class="dialogo" style="max-width:min(960px,96vw)">
+        <h3>Historia de mercancía</h3>
+        <p class="muted" style="margin:0 0 8px">${e(p.nombre)} <small>${e(p.codigo || "")} · ${e(p.familia || "")}</small></p>
+        <div class="kpis" style="margin-bottom:8px">
+          <div class="kpi"><span>Inicio período</span><b class="num">${fmt(d.inicio, 2)}</b></div>
+          <div class="kpi"><span>Final</span><b class="num">${fmt(d.final, 2)}</b></div>
+          <div class="kpi"><span>Stock actual</span><b class="num">${fmt(d.stockTotal, 2)}</b></div>
+          <div class="kpi"><span>Movimientos</span><b class="num">${fmt(d.movimientos, 0)}</b></div>
+        </div>
+        <div class="scroll" style="max-height:50vh"><table>
+          <tr><th>Fecha</th><th>Operación</th><th class="d">Entrada</th><th class="d">Salida</th><th class="d">Final</th><th class="d">Importe</th></tr>
+          ${filas}
+        </table></div>
+        <div class="acciones"><button class="btn sec" data-act="cerrarModal">Cerrar</button></div>
+      </div>`);
+    } catch (err) {
+      abrirModal(`<div class="dialogo"><p class="error">${e(err.message || "Error")}</p><div class="acciones"><button class="btn" data-act="cerrarModal">Cerrar</button></div></div>`);
+    }
+  },
   csvFisico: () => descargarCSV("inventario-fisico.csv", [["Producto", "Código", "Sistema", "Físico", "Diferencia", "Valor"], ...(S.fisicoCsv || []).map((x) => [x.nombre, x.codigo, x.sistema, x.fisico, x.diferencia, x.valor])]),
 };
 
@@ -1553,15 +1727,19 @@ const ENT = {
   ordenProd: (el) => { S.prod.orden = el.value; S.prod.pagina = 1; recargarProd(); },
   activosProd: (el) => { S.prod.activos = el.checked; S.prod.pagina = 1; recargarProd(); },
   buscaExis: (el) => {
+    // Solo guarda el texto; en IPV no se repinta al teclear (se aplica con "Aplicar")
     S.exis.q = el.value; S.exis.pagina = 1;
-    if (S.vista === "inventario" && S.invSub === "ipv") vista(true);
-    else recargarExis();
+    if (S.vista === "inventario" && (S.invSub === "ipv" || S.invSub === "traspasos")) return;
+    recargarExis();
   },
   localExis: (el) => {
     S.exis.local = el.value; S.exis.pagina = 1;
-    if (S.vista === "inventario" && S.invSub === "ipv") vista(true);
-    else recargarExis();
+    if (S.vista === "inventario" && S.invSub === "ipv") return; // Aplicar al cambiar o botón
+    if (S.vista === "inventario" && S.invSub === "traspasos") { vista(true); return; }
+    recargarExis();
   },
+  origenTr: (el) => { S.exis.origen = el.value; },
+  destinoTr: (el) => { S.exis.destino = el.value; },
   tipoEv: (el) => { S.ev.tipo = el.value; S.ev.pagina = 1; vista(true); },
   rolUsuario: async (el) => { try { await post("/api/ajustes/rol", { id: el.dataset.id, rol: el.value }); aviso("Rol cambiado"); } catch (err) { aviso(err.message); vista(true); } },
 };
@@ -1571,7 +1749,7 @@ const manejarEntrada = (ev) => {
   const ahora = ev.type === "change" || el.tagName === "SELECT" || el.type === "checkbox";
   if (ev.type === "input" && ahora) return;
   clearTimeout(tEntrada);
-  if (ahora) ENT[el.dataset.in](el); else tEntrada = setTimeout(() => ENT[el.dataset.in](el), 300);
+  if (ahora) ENT[el.dataset.in](el); else tEntrada = setTimeout(() => ENT[el.dataset.in](el), 550);
 };
 document.addEventListener("input", manejarEntrada);
 document.addEventListener("change", manejarEntrada);

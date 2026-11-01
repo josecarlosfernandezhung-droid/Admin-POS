@@ -285,7 +285,7 @@ const MODULO = {
   existencias: "existencias", caja: "caja", equipo: "equipo", productividad: "equipo", "duracion-turnos": "equipo", ranking: "equipo", "turnos-horario": "equipo",
   alertas: "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", "historial-mercancia": "inventario", traspasos: "inventario",
   antiguedad: "inventario", "traspasos-hechos": "inventario", fisico: "inventario", "lista-arqueo": "inventario",
-  anomalias: "perdidas", eventos: "perdidas", mermas: "perdidas", auditoria: "perdidas",
+  anomalias: "perdidas", eventos: "perdidas", mermas: "perdidas", auditoria: "perdidas", "informe-auditoria": "perdidas",
   devoluciones: "perdidas", "patrones-anulacion": "perdidas",
   "alertas-inicio": "resumen", panel: "resumen", comparar: "resumen", buscar: "resumen",
 };
@@ -318,6 +318,7 @@ async function consulta(res, nombre, s, p, q) {
     case "eventos": datos = await Q.eventos(p, ctx, q); break;
     case "mermas": datos = await Q.mermas(p, ctx); break;
     case "auditoria": datos = await Q.auditoria(p, ctx); break;
+    case "informe-auditoria": datos = await Q.informeAuditoria(p, ctx); break;
     case "devoluciones": datos = await Q.devolucionesDetalle(p, ctx); break;
     case "antiguedad": datos = await Q.antiguedadStock(p, ctx); break;
     case "traspasos-hechos": datos = await Q.traspasosHechos(p, ctx, q); break;

@@ -59,9 +59,10 @@ export async function resolverRango(pool, periodo, q = {}) {
     let desde = ymdOk(q.desde) ? q.desde : ext.desde;
     let hasta = ymdOk(q.hasta) ? q.hasta : ext.hasta;
     if (desde > hasta) [desde, hasta] = [hasta, desde];
-    // No pasar del último día con ventas
-    if (hasta > ext.hasta) hasta = ext.hasta;
-    if (desde < ext.desde) desde = ext.desde;
+    // Rango personalizado: respetar el día elegido (informe de un solo día, logs, caja).
+    // Solo se limita a un máximo de 3 años hacia atrás por seguridad.
+    const minDesde = sumarDias(ext.hasta, -365 * 3);
+    if (desde < minDesde) desde = minDesde;
     const dias = difDias(desde, hasta) + 1;
     const r = { desde, hasta, dias, todo: false, ultimo: ext.hasta, personalizado: true };
     r.aHasta = sumarDias(desde, -1);
@@ -2879,5 +2880,444 @@ export async function busquedaGlobal(pool, ctx, q) {
     tickets: tickets.map((x) => ({ acct: num(x.acct), ticket: numTicket(x.acct), fecha: x.fecha, cajero: x.cajero, total: num(x.total) })),
     productos: productos.map((x) => ({ id: x.id, codigo: x.codigo, nombre: x.nombre, precio: num(x.precio) })),
     usuarios: usuarios.map((x) => ({ id: x.id, nombre: x.nombre })),
+  };
+}
+
+/** Informe formal de auditoría (resumen ejecutivo, hallazgos, fichas, anexos). */
+export async function informeAuditoria(pool, ctx) {
+  const { desde, hasta } = ctx.r;
+  const aj = ctx.aj || {};
+  const tol = num(aj.tolCierre) || 500;
+  const P = [desde, hasta];
+
+  const [
+    cajaData,
+    ventasRes,
+    tarjetaSinBanco,
+    parcialesCero,
+    anulaciones,
+    cancelaciones,
+    consumoCasa,
+    cambiosPrecio,
+    productosElim,
+    stockNeg,
+    arqueosAjuste,
+    porUsuarioVentas,
+    porUsuarioAnul,
+    porUsuarioCancel,
+    porUsuarioDev,
+    evidenciasParcialFinal,
+  ] = await Promise.all([
+    caja(pool, { ...ctx, uid: null }, { todo: true }),
+    una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} AND ${RANGO}`, P),
+    // Tickets pagados con tarjeta (Mode 2) — señal para cruzar con banco
+    filas(
+      pool,
+      `SELECT p.Acct AS acct, MAX(p.Qtty) AS monto, MAX(p.Mode) AS modo,
+              MAX(DATE_FORMAT(sh.DateTimeOpen,'%Y-%m-%d %H:%i')) AS turno,
+              MAX(u.Name) AS cajero, MAX(o.Name) AS local
+       FROM payments p
+       JOIN shift sh ON sh.ID = p.ShiftID
+       LEFT JOIN users u ON u.ID = sh.UserID
+       LEFT JOIN objects o ON o.ID = sh.ObjectID
+       WHERE p.OperType = 2 AND p.Mode = 2
+         AND sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)
+       GROUP BY p.Acct
+       ORDER BY monto DESC LIMIT 80`,
+      P
+    ).catch(() => []),
+    // Cierres con contado 0 y libro/esperado > 0 ("cuenta a casa $0")
+    Promise.resolve(null), // se llena desde cajaData
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE 'Anular venta%' OR l.Message LIKE '%Anular venta%' OR l.Message LIKE '%anulada%')
+       ORDER BY l.UserRealTime DESC LIMIT 100`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND l.Message LIKE '%operación cancelada%'
+       ORDER BY l.UserRealTime DESC LIMIT 100`,
+      P
+    ).catch(() => []),
+    // Consumo casa: Partner con nombre tipo casa / consumo interno / OperType especiales
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(${F},'%Y-%m-%d %H:%i') AS fecha, g.Name AS producto, ABS(o.Qtty) AS cant,
+              ${IMP} AS importe, u.Name AS usuario, COALESCE(p.Company, p.Name, '') AS socio, o.Note AS nota
+       FROM operations o
+       LEFT JOIN goods g ON g.ID = o.GoodID
+       LEFT JOIN users u ON u.ID = o.UserID
+       LEFT JOIN partners p ON p.ID = o.PartnerID
+       WHERE ${RANGO} AND (
+         LOWER(COALESCE(p.Company,'')) LIKE '%casa%'
+         OR LOWER(COALESCE(p.Name,'')) LIKE '%casa%'
+         OR LOWER(COALESCE(p.Company,'')) LIKE '%consumo%'
+         OR LOWER(COALESCE(o.Note,'')) LIKE '%casa%'
+         OR LOWER(COALESCE(o.Note,'')) LIKE '%consumo%'
+         OR o.OperType IN (12, 13)
+       )
+       ORDER BY ${F} DESC LIMIT 80`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE '%precio de venta%' OR l.Message LIKE '%antiguo precio%' OR l.Message LIKE '%modificado la mercanc%')
+       ORDER BY l.UserRealTime DESC LIMIT 80`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE '%eliminó%' OR l.Message LIKE '%eliminado%' OR l.Message LIKE '%se eliminó%')
+       ORDER BY l.UserRealTime DESC LIMIT 60`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, SUM(s.Qtty) AS stock, ${PRECIO} AS precio
+       FROM store s JOIN goods g ON g.ID = s.GoodID
+       WHERE COALESCE(g.Deleted,0)=0
+       GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3
+       HAVING SUM(s.Qtty) < -0.0005
+       ORDER BY stock ASC LIMIT 80`
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE '%auditoría de caja%' OR l.Message LIKE '%auditoria de caja%' OR l.Message LIKE '%ajuste%' OR l.Message LIKE '%reconteo%')
+       ORDER BY l.UserRealTime DESC LIMIT 60`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT u.ID AS id, u.Name AS nombre, SUM(${IMP}) AS ventas, COUNT(DISTINCT o.Acct) AS tickets
+       FROM operations o JOIN users u ON u.ID = o.UserID
+       WHERE ${VENTA} AND ${RANGO} GROUP BY u.ID, u.Name ORDER BY ventas DESC`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT u.ID AS id, u.Name AS nombre, COUNT(*) AS n
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE 'Anular venta%' OR l.Message LIKE '%Anular venta%')
+       GROUP BY u.ID, u.Name ORDER BY n DESC`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT u.ID AS id, u.Name AS nombre, COUNT(*) AS n
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND l.Message LIKE '%operación cancelada%'
+       GROUP BY u.ID, u.Name ORDER BY n DESC`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT u.ID AS id, u.Name AS nombre, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS docs
+       FROM operations o JOIN users u ON u.ID = o.UserID
+       WHERE ${DEVOL} AND ${RANGO} GROUP BY u.ID, u.Name ORDER BY total DESC`,
+      P
+    ).catch(() => []),
+    // Parcial vs final: turnos con contado 0 vs con conteo, y reaperturas en log
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (
+         l.Message LIKE '%parcial%' OR l.Message LIKE '%final%'
+         OR l.Message LIKE '%recont%' OR l.Message LIKE '%TotalFinal%'
+         OR l.Message LIKE '%cerró%' OR l.Message LIKE '%cierre%'
+       )
+       ORDER BY l.UserRealTime DESC LIMIT 80`,
+      P
+    ).catch(() => []),
+  ]);
+
+  const parciales = (cajaData.filas || []).filter((t) => t.sinContar || (t.contado === 0 && Math.abs(t.esperado || 0) > 1));
+  const conDif = (cajaData.filas || []).filter((t) => t.nivel === "media" || t.nivel === "alta");
+
+  // Fichas por trabajador
+  const mapa = new Map();
+  const touch = (id, nombre) => {
+    const k = String(id || nombre || "?");
+    if (!mapa.has(k))
+      mapa.set(k, {
+        id: id || null,
+        nombre: nombre || "—",
+        ventas: 0,
+        tickets: 0,
+        anulaciones: 0,
+        cancelaciones: 0,
+        devoluciones: 0,
+        docsDev: 0,
+        faltante: 0,
+        sobrante: 0,
+        turnos: 0,
+        turnosDif: 0,
+        sinContar: 0,
+        señales: [],
+      });
+    return mapa.get(k);
+  };
+  for (const x of porUsuarioVentas) {
+    const f = touch(x.id, x.nombre);
+    f.ventas = num(x.ventas);
+    f.tickets = num(x.tickets);
+  }
+  for (const x of porUsuarioAnul) {
+    const f = touch(x.id, x.nombre);
+    f.anulaciones = num(x.n);
+  }
+  for (const x of porUsuarioCancel) {
+    const f = touch(x.id, x.nombre);
+    f.cancelaciones = num(x.n);
+  }
+  for (const x of porUsuarioDev) {
+    const f = touch(x.id, x.nombre);
+    f.devoluciones = num(x.total);
+    f.docsDev = num(x.docs);
+  }
+  for (const c of cajaData.porCajero || []) {
+    const f = touch(null, c.usuario);
+    f.nombre = c.usuario;
+    f.faltante = num(c.faltante);
+    f.sobrante = num(c.sobrante);
+    f.turnos = num(c.turnos);
+    f.turnosDif = num(c.conDif);
+    f.sinContar = num(c.sinContar);
+  }
+  const fichas = [...mapa.values()].map((f) => {
+    const señales = [];
+    if (f.faltante > tol * 3) señales.push({ nivel: "alta", texto: `Faltante acumulado ${Math.round(f.faltante)} CUP` });
+    if (f.anulaciones >= 10) señales.push({ nivel: "alta", texto: `${f.anulaciones} anulaciones` });
+    else if (f.anulaciones >= 3) señales.push({ nivel: "media", texto: `${f.anulaciones} anulaciones` });
+    if (f.cancelaciones >= 15) señales.push({ nivel: "media", texto: `${f.cancelaciones} cancelaciones` });
+    if (f.sinContar >= 2) señales.push({ nivel: "media", texto: `${f.sinContar} cierres sin contar` });
+    if (f.turnosDif >= 3) señales.push({ nivel: "media", texto: `${f.turnosDif} turnos fuera de tolerancia` });
+    if (!señales.length && f.ventas > 0) señales.push({ nivel: "ok", texto: "Sin señales fuertes" });
+    return { ...f, señales, netoComunal: redondear(f.faltante - f.sobrante) };
+  }).sort((a, b) => b.faltante - a.faltante || b.anulaciones - a.anulaciones || b.ventas - a.ventas);
+
+  const hallazgos = [];
+  if ((cajaData.faltante || 0) > tol)
+    hallazgos.push({
+      nivel: "alta",
+      titulo: `Faltante de efectivo: ${Math.round(cajaData.faltante)} CUP`,
+      texto: "Suma de turnos donde el contado fue menor que el libro de caja (DiffClose > 0), fuera de tolerancia.",
+      seccion: "caja",
+    });
+  if ((cajaData.sobrante || 0) > tol)
+    hallazgos.push({
+      nivel: "media",
+      titulo: `Sobrante de efectivo: ${Math.round(cajaData.sobrante)} CUP`,
+      texto: "Suma de turnos con contado mayor al esperado. Revisar retiros no registrados o reconteos.",
+      seccion: "caja",
+    });
+  if (parciales.length)
+    hallazgos.push({
+      nivel: "alta",
+      titulo: `${parciales.length} cierre(s) con contado $0 (parcial / cuenta a casa)`,
+      texto: "El turno cerró sin conteo físico; Axis deja el esperado como diferencia. No equivale a faltante probado hasta que se reconte.",
+      seccion: "parciales",
+    });
+  if (tarjetaSinBanco.length)
+    hallazgos.push({
+      nivel: "media",
+      titulo: `${tarjetaSinBanco.length} tickets con pago tarjeta en el período`,
+      texto: "Cruzar montos y fechas con el extracto bancario. Admin POS no ve el banco: solo registra el Mode=tarjeta en Axis.",
+      seccion: "tarjeta",
+    });
+  if (anulaciones.length >= 5)
+    hallazgos.push({
+      nivel: "media",
+      titulo: `${anulaciones.length} anulaciones de venta en el log`,
+      texto: "Revisar si hay patrón por usuario o ticket reabierto/recobrado.",
+      seccion: "anulaciones",
+    });
+  if (consumoCasa.length)
+    hallazgos.push({
+      nivel: "media",
+      titulo: `${consumoCasa.length} movimientos tipo consumo/casa`,
+      texto: "Salidas asociadas a socio/nota 'casa' o consumo interno. Verificar autorización.",
+      seccion: "casa",
+    });
+  if (stockNeg.length)
+    hallazgos.push({
+      nivel: "alta",
+      titulo: `${stockNeg.length} productos con stock negativo`,
+      texto: "Existencia < 0: ventas sin entrada, traspasos mal cargados o conteos pendientes.",
+      seccion: "inventario",
+    });
+  if (productosElim.length)
+    hallazgos.push({
+      nivel: "media",
+      titulo: `${productosElim.length} eventos de eliminación en el log`,
+      texto: "Productos o líneas eliminadas. Contrastar con inventario.",
+      seccion: "eliminados",
+    });
+  if (cambiosPrecio.length >= 10)
+    hallazgos.push({
+      nivel: "media",
+      titulo: `${cambiosPrecio.length} cambios de precio registrados`,
+      texto: "Ver quién cambió y si coinciden con ventas o arqueos dudosos.",
+      seccion: "precios",
+    });
+  if (!hallazgos.length)
+    hallazgos.push({
+      nivel: "ok",
+      titulo: "Sin hallazgos prioritarios en el período",
+      texto: "No hay señales fuertes con los umbrales actuales; conviene revisar anexos igual.",
+      seccion: "ok",
+    });
+
+  const recomendaciones = [];
+  if (parciales.length)
+    recomendaciones.push("Prohibir o controlar cierres con contado 0: exigir arqueo físico antes de cerrar turno.");
+  if ((cajaData.faltante || 0) > tol)
+    recomendaciones.push("Cuadrar faltantes por cajero y turno; documentar justificación o descuento de nómina según política.");
+  if (tarjetaSinBanco.length)
+    recomendaciones.push("Conciliar semanalmente pagos Mode=tarjeta de Axis vs depósitos/extracto bancario.");
+  if (stockNeg.length)
+    recomendaciones.push("Correr conteo físico de los SKU en negativo y ajustar con documento de inventario.");
+  if (anulaciones.length >= 5)
+    recomendaciones.push("Limitar permiso de anular ventas y exigir motivo obligatorio en Axis.");
+  if (consumoCasa.length)
+    recomendaciones.push("Registrar consumo de casa con socio fijo y tope diario; revisar listado en este informe.");
+  if (cambiosPrecio.length >= 10)
+    recomendaciones.push("Restringir cambio de precio a un rol supervisor y auditar el log semanalmente.");
+  recomendaciones.push("Mantener tolerancia de caja explícita (Ajustes) y revisar solo desviaciones fuera de tolerancia.");
+  recomendaciones.push("Conservar este informe + backup .woback del período como anexo de auditoría.");
+
+  const netoComunal = redondear((cajaData.faltante || 0) - (cajaData.sobrante || 0));
+
+  return {
+    meta: {
+      titulo: "Informe de auditoría operativa",
+      desde,
+      hasta,
+      generado: new Date().toISOString(),
+      toleranciaCaja: tol,
+      fuentes: [
+        "Base AxisPOS (MariaDB): operations, payments, shift, cashbook, store, goods, partners, users",
+        "applicationlog de AxisPOS (cancelaciones, anulaciones, precios, eliminaciones, cierres)",
+        "DiffClose y libro de caja (cashbook) para efectivo",
+      ],
+      metodo: [
+        "Ventas = OperType 2 y Sign < 0; importe = |Qtty| × PriceOut (descuento ya en precio).",
+        "Efectivo: esperado = TotalOpen + Σ(Sign×Profit cashbook) − TotalWithdrawal; diferencia = DiffClose Axis.",
+        "Faltante si DiffClose > tolerancia; sobrante si DiffClose < −tolerancia.",
+        "Tarjeta = payments Mode 2; no se valida depósito bancario (fuera de alcance del POS).",
+        "Consumo casa = socio/nota con 'casa'/'consumo' u OperType 12/13 si existen.",
+        "Stock negativo = SUM(store.Qtty) < 0 por producto.",
+      ],
+    },
+    resumenEjecutivo: {
+      ventas: num(ventasRes.total),
+      tickets: num(ventasRes.tickets),
+      faltante: cajaData.faltante || 0,
+      sobrante: cajaData.sobrante || 0,
+      netoComunal,
+      turnos: cajaData.turnos || 0,
+      turnosFueraTol: cajaData.conDiferencia || 0,
+      cerradosSinContar: parciales.length,
+      ticketsTarjeta: tarjetaSinBanco.length,
+      anulaciones: anulaciones.length,
+      cancelaciones: cancelaciones.length,
+      stockNegativo: stockNeg.length,
+      cambiosPrecio: cambiosPrecio.length,
+      texto:
+        `Período ${desde} a ${hasta}. Ventas ${Math.round(num(ventasRes.total))} CUP en ${num(ventasRes.tickets)} tickets. ` +
+        `Efectivo: faltante ${Math.round(cajaData.faltante || 0)} / sobrante ${Math.round(cajaData.sobrante || 0)} ` +
+        `(neto comunal ${Math.round(netoComunal)}). ` +
+        `${parciales.length} cierres sin conteo, ${tarjetaSinBanco.length} tickets tarjeta a conciliar con banco, ` +
+        `${anulaciones.length} anulaciones en log, ${stockNeg.length} SKU en negativo.`,
+    },
+    hallazgos,
+    detalle: {
+      tarjetaSinBanco: tarjetaSinBanco.map((x) => ({
+        acct: num(x.acct),
+        ticket: numTicket(x.acct),
+        monto: num(x.monto),
+        cajero: x.cajero || "",
+        local: x.local || "",
+        turno: x.turno,
+      })),
+      parcialesCero: parciales.map((t) => ({
+        id: t.id,
+        usuario: t.usuario,
+        apertura: t.apertura,
+        cierre: t.cierre,
+        esperado: t.esperado,
+        contado: t.contado,
+        diferencia: t.diferencia,
+        libroCaja: t.libroCaja,
+      })),
+      anulaciones: anulaciones.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+      cancelaciones: cancelaciones.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+      consumoCasa: consumoCasa.map((x) => ({
+        fecha: x.fecha,
+        producto: x.producto,
+        cant: num(x.cant),
+        importe: num(x.importe),
+        usuario: x.usuario || "",
+        socio: x.socio || "",
+        nota: x.nota || "",
+      })),
+      cambiosPrecio: cambiosPrecio.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+      productosEliminados: productosElim.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+      stockNegativo: stockNeg.map((x) => ({
+        id: x.id,
+        codigo: x.codigo,
+        nombre: x.nombre,
+        stock: num(x.stock),
+        precio: num(x.precio),
+      })),
+      arqueosAjustes: arqueosAjuste.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+      evidenciasParcialFinal: evidenciasParcialFinal.map((x) => ({
+        fecha: x.fecha,
+        usuario: x.usuario || "—",
+        mensaje: x.mensaje,
+      })),
+      turnosConDiferencia: conDif.slice(0, 40).map((t) => ({
+        id: t.id,
+        usuario: t.usuario,
+        apertura: t.apertura,
+        esperado: t.esperado,
+        contado: t.contado,
+        diferencia: t.diferencia,
+        nivel: t.nivel,
+      })),
+    },
+    fichasTrabajadores: fichas,
+    conclusionesPorPersona: fichas
+      .filter((f) => f.señales.some((s) => s.nivel !== "ok") || f.ventas > 0)
+      .map((f) => ({
+        nombre: f.nombre,
+        resumen:
+          `Ventas ${Math.round(f.ventas)} CUP (${f.tickets} tickets). ` +
+          `Anulaciones ${f.anulaciones}, cancelaciones ${f.cancelaciones}, ` +
+          `devoluciones ${Math.round(f.devoluciones)} CUP. ` +
+          `Caja: faltante ${Math.round(f.faltante)}, sobrante ${Math.round(f.sobrante)}, ` +
+          `neto comunal ${Math.round(f.netoComunal)}, cierres sin contar ${f.sinContar}.`,
+        señales: f.señales,
+      })),
+    recomendaciones,
+    limitaciones: [
+      "No se accede al extracto bancario: los pagos con tarjeta deben conciliarse a mano.",
+      "Los cierres con contado 0 inflan DiffClose en Axis; no demuestran por sí solos apropiación.",
+      "Consumo de casa depende de cómo se nombró el socio/nota en Axis; puede haber falsos positivos o faltantes.",
+      "El log (applicationlog) puede truncarse o no registrar todos los eventos según versión de Axis.",
+      "Stock negativo es síntoma; la causa (venta, merma, traspaso) requiere IPV/historial del producto.",
+      "Este informe es de lectura sobre la base; no modifica datos ni sustituye auditoría contable formal.",
+    ],
   };
 }

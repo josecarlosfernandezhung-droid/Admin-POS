@@ -280,10 +280,10 @@ async function ajustesPost(req, res, ruta, s, p) {
 
 // ---------- Consultas con permiso ----------
 const MODULO = {
-  resumen: "resumen", ventas: "ventas", ticket: "ventas", "ventas-dia": "ventas",
+  resumen: "resumen", ventas: "ventas", "ventas-modo": "ventas", ticket: "ventas", "ventas-dia": "ventas",
   productos: "productos", top: "productos", "prod-tx": "productos", "cambios-precio": "productos", margen: "productos", "efecto-precios": "productos",
-  existencias: "existencias", caja: "caja", equipo: "equipo", productividad: "equipo", "duracion-turnos": "equipo", ranking: "equipo", "turnos-horario": "equipo",
-  alertas: "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", "historial-mercancia": "inventario", traspasos: "inventario",
+  existencias: "existencias", caja: "caja", equipo: "equipo", "equipo-modo": "equipo", productividad: "equipo", "duracion-turnos": "equipo", ranking: "equipo", "turnos-horario": "equipo",
+  alertas: "inventario", "inventario-modo": "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", "historial-mercancia": "inventario", traspasos: "inventario",
   antiguedad: "inventario", "traspasos-hechos": "inventario", fisico: "inventario", "lista-arqueo": "inventario",
   anomalias: "perdidas", eventos: "perdidas", mermas: "perdidas", auditoria: "perdidas", "informe-auditoria": "perdidas",
   devoluciones: "perdidas", "patrones-anulacion": "perdidas",
@@ -294,21 +294,39 @@ async function consulta(res, nombre, s, p, q) {
   if (!A.PERMISOS[s.rol].includes(MODULO[nombre] || "conteos") && nombre !== "conteos") return falla(res, 403, "Tu rol no tiene acceso a esta sección.");
   const aj = A.leer().ajustes;
   const r = await Q.resolverRango(p, q.periodo, q);
-  const ctx = { r, uid: s.rol === "cajero" ? s.id : null, rol: s.rol, aj, rolDe: A.rolDe };
+  // Admin puede filtrar por cajero/local; cajero siempre ve solo lo suyo
+  let uidFiltro = s.rol === "cajero" ? s.id : null;
+  if (uidFiltro == null && q.usuario) {
+    const u = parseInt(q.usuario, 10);
+    if (Number.isInteger(u)) uidFiltro = u;
+  }
+  const localFiltro = q.local != null && q.local !== "" ? parseInt(q.local, 10) : null;
+  const ctx = {
+    r,
+    uid: uidFiltro,
+    local: Number.isInteger(localFiltro) ? localFiltro : null,
+    rol: s.rol,
+    aj,
+    rolDe: A.rolDe,
+  };
   let datos;
   switch (nombre) {
     case "resumen": datos = { ...(await Q.resumen(p, ctx)), tasa: aj.tasa }; break;
     case "ventas": datos = await Q.ventas(p, ctx, q); break;
-    case "ventas-dia": datos = await Q.ventasPorDia(p, ctx); break;
+    case "ventas-modo": datos = await Q.ventasModo(p, ctx, q); break;
+    case "ventas-dia": datos = await Q.ventasModo(p, ctx, { ...q, modo: "dia" }); break;
     case "ticket": datos = await Q.ticket(p, ctx, parseInt(String(q.acct || "").replace(/\D/g, ""), 10)); if (!datos) return falla(res, 404, "Ticket no encontrado."); break;
     case "productos": datos = await Q.productos(p, ctx, q); break;
+    case "productos-modo": datos = await Q.productosModo(p, ctx, q); break;
     case "top": datos = await Q.topProductos(p, ctx, q); break;
     case "prod-tx": datos = await Q.transaccionesProducto(p, ctx, q); break;
     case "cambios-precio": datos = await Q.cambiosPrecio(p, ctx, q); break;
     case "existencias": datos = await Q.existencias(p, ctx, q); break;
     case "caja": datos = await Q.caja(p, ctx, q); break;
     case "equipo": datos = await Q.equipoCompleto(p, ctx); break;
+    case "equipo-modo": datos = await Q.equipoModo(p, ctx, q); break;
     case "alertas": datos = await Q.alertasStock(p, ctx); break;
+    case "inventario-modo": datos = await Q.inventarioModo(p, ctx, q); break;
     case "abc": datos = await Q.analisisABC(p, ctx, q); break;
     case "compras": datos = await Q.sugerenciasCompra(p, ctx); break;
     case "ipv": datos = await Q.ipv(p, ctx, q); break;
@@ -327,12 +345,12 @@ async function consulta(res, nombre, s, p, q) {
     case "productividad": datos = await Q.productividad(p, ctx); break;
     case "patrones-anulacion": datos = await Q.patronesAnulacion(p, ctx); break;
     case "duracion-turnos": datos = await Q.duracionTurnos(p, ctx); break;
-    case "alertas-inicio": datos = await Q.alertasInicio(p, ctx); break;
-    case "panel": datos = await Q.panelDueno(p, ctx); break;
+    case "alertas-inicio": datos = (await Q.resumen(p, ctx)).alertasInicio || await Q.alertasInicio(p, ctx); break;
+    case "panel": datos = (await Q.resumen(p, ctx)).panel || await Q.panelDueno(p, ctx); break;
     case "comparar": datos = await Q.compararPeriodos(p, ctx, q); break;
     case "buscar": datos = await Q.busquedaGlobal(p, ctx, q); break;
     case "lista-arqueo": datos = await Q.listaArqueo(p, ctx, q); break;
-    case "ranking": datos = await Q.rankingEquipo(p, ctx); break;
+    case "ranking": datos = await Q.equipoModo(p, ctx, { ...q, modo: "ranking" }); break;
     case "turnos-horario": datos = await Q.turnosHorario(p, ctx); break;
     case "conteos": {
       datos = {};

@@ -176,7 +176,7 @@ export async function resumen(pool, ctx) {
   const descuentos = num(costoDesc.descuentos);
   const ganancia = total - costo;
   const pct = (a, b) => (b > 0 ? redondear(((a - b) / b) * 100, 1) : null);
-  return {
+  const base = {
     desde, hasta, dias: ctx.r.dias, ultimoDia: ultimo,
     total, tickets, unidades: num(tot.unidades), promedio: tickets ? total / tickets : 0,
     devoluciones: num(dev.total), devDocs: num(dev.docs), neto: total - num(dev.total),
@@ -222,9 +222,24 @@ export async function resumen(pool, ctx) {
       horasHoy: hoyHoras.map((x) => ({ hora: num(x.hora), total: num(x.total) })),
     },
   };
+  try {
+    const [panel, alertas] = await Promise.all([
+      panelDueno(pool, ctx).catch(() => null),
+      alertasInicio(pool, ctx).catch(() => null),
+    ]);
+    base.panel = panel;
+    base.alertasInicio = alertas;
+  } catch (_) {}
+  return base;
 }
 
 // ---------- Ventas ----------
+export async function ventasModo(pool, ctx, q = {}) {
+  const modo = String(q.modo || "tickets");
+  if (modo === "dia" || modo === "por-dia") return ventasPorDia(pool, ctx);
+  return ventas(pool, ctx, q);
+}
+
 export async function ventas(pool, ctx, q) {
   const { desde, hasta } = ctx.r;
   const busca = String(q.q || "").trim().slice(0, 60);
@@ -260,15 +275,34 @@ export async function ticket(pool, ctx, acct) {
   }
   const lineas = await filas(
     pool,
-    `SELECT o.ID AS id, o.OperType AS tipo, g.Name AS nombre, ABS(o.Qtty) AS cant, o.PriceOut AS precio,
+    `SELECT o.ID AS id, o.OperType AS tipo, o.Sign AS sign, g.Name AS nombre, o.Qtty AS qtty, ABS(o.Qtty) AS cant, o.PriceOut AS precio,
             IF(o.Discount BETWEEN 0 AND 100, o.Discount, 0) AS descuento, ${IMP} AS importe,
             ${F} AS fecha, u.Name AS cajero, p.Company AS socio, o.Note AS nota
      FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID LEFT JOIN users u ON u.ID = o.UserID LEFT JOIN partners p ON p.ID = o.PartnerID
-     WHERE o.Acct = ? AND o.OperType IN (2, 34)${extra} ORDER BY o.ID`,
+     WHERE o.Acct = ?${extra} ORDER BY o.ID`,
     params
   );
-  if (!lineas.length) return null;
-  const devol = lineas[0].tipo === 34;
+  if (!lineas.length) {
+    // Solo logs (anulación sin líneas restantes)
+    const logsSolo = await filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE l.Message LIKE ? OR l.Message LIKE ?
+       ORDER BY l.UserRealTime DESC LIMIT 30`,
+      [`%${acct}%`, `%${numTicket(acct)}%`]
+    ).catch(() => []);
+    if (!logsSolo.length) return null;
+    return {
+      ticket: numTicket(acct), acct: num(acct), devolucion: false, anulado: true,
+      fecha: logsSolo[0]?.fecha, cajero: logsSolo[0]?.usuario || "", socio: "",
+      lineas: [], total: 0, logs: logsSolo.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: String(x.mensaje || "").replace(/\s+/g, " ").slice(0, 300) })),
+      pagos: [], estado: "Solo en log (sin líneas de operación)",
+    };
+  }
+  const devol = lineas.some((l) => num(l.tipo) === 34);
+  const signs = lineas.map((l) => num(l.sign));
+  const anulado = signs.every((s) => s === 0) || lineas.every((l) => num(l.tipo) !== 2 && num(l.tipo) !== 34);
 
   // Buscar en el log si este ticket fue anulado o cancelado
   const logs = await filas(
@@ -292,22 +326,27 @@ export async function ticket(pool, ctx, acct) {
     ticket: numTicket(acct),
     acct: num(acct),
     devolucion: devol,
+    anulado: !!anulado,
+    estado: anulado ? "Anulada / no finalizada" : devol ? "Devolución" : "Venta",
     fecha: lineas[0].fecha,
     cajero: lineas[0].cajero,
     socio: lineas[0].socio,
     lineas: lineas.map((l) => ({
       nombre: l.nombre,
+      tipo: num(l.tipo),
+      sign: num(l.sign),
       cant: num(l.cant),
+      qtty: num(l.qtty),
       precio: num(l.precio),
       descuento: num(l.descuento),
       importe: num(l.importe),
       nota: l.nota || "",
     })),
-    total: lineas.reduce((s, l) => s + num(l.importe), 0),
+    total: lineas.filter((l) => num(l.tipo) === 2 || num(l.tipo) === 34).reduce((s, l) => s + num(l.importe), 0),
     logs: logs.map((x) => ({
       fecha: x.fecha,
       usuario: x.usuario || "—",
-      mensaje: String(x.mensaje || "").replace(/\s+/g, " ").slice(0, 200),
+      mensaje: String(x.mensaje || "").replace(/\s+/g, " ").slice(0, 300),
     })),
     pagos: (pagos || []).map((p) => ({
       modo: p.modo,
@@ -359,6 +398,13 @@ export async function productos(pool, ctx, q) {
 }
 
 // ---------- Top productos ----------
+export async function productosModo(pool, ctx, q) {
+  const modo = String(q.modo || "lista");
+  if (modo === "top") return topProductos(pool, ctx, q);
+  if (modo === "margen") return margenProductos(pool, ctx);
+  return productos(pool, ctx, q);
+}
+
 export async function topProductos(pool, ctx, q) {
   const { desde, hasta } = ctx.r;
   const limite = Math.min(Math.max(parseInt(q.limite, 10) || 50, 10), 200);
@@ -682,8 +728,9 @@ export async function ipv(pool, ctx, q) {
   let movLocal = "";
   // Filtrar por local vía turno si se pide
   if (tieneLocal) {
-    movLocal = " AND EXISTS (SELECT 1 FROM shift sh WHERE sh.ID = o.ShiftID AND sh.ObjectID = ?)";
-    movParams.push(local);
+    // Mismo local que el stock: ObjectID de la operación o del turno
+    movLocal = " AND (o.ObjectID = ? OR EXISTS (SELECT 1 FROM shift sh WHERE sh.ID = o.ShiftID AND sh.ObjectID = ?))";
+    movParams.push(local, local);
   }
   const movs = await filas(
     pool,
@@ -795,6 +842,7 @@ export async function ipv(pool, ctx, q) {
   const filasMov = [...porProd.values()].map((p) => {
     const final = p.final;
     const inicio = redondear(final - p.netoMov, 3);
+    if (inicio < -0.0005) { /* contado abajo */ }
     const costoU = costoDe(p.costoUnit, p.precioUnit, pctCostoIpv);
     return {
       id: p.id,
@@ -879,6 +927,8 @@ export async function ipv(pool, ctx, q) {
     resumen: {
       productos: filasMov.length,
       inicio: redondear(tot.inicio, 2),
+      avisoInicioNegativo: tot.inicio < -0.5,
+      productosInicioNeg: filasMov.filter((x) => num(x.inicio) < -0.0005).length,
       entradas: redondear(tot.entradas, 2),
       ventas: redondear(tot.ventas, 2),
       devoluciones: redondear(tot.devoluciones, 2),
@@ -1353,10 +1403,12 @@ export async function caja(pool, ctx, q) {
     const pagosTodos = num(t.pagosTodos);
     const difPagos = redondear(pagosTodos - (ventas - dev));
 
+    // Cierres sin conteo: DiffClose de Axis ≈ todo el esperado; NO es faltante real.
     let nivel = "ok";
     if (sinContar) nivel = "media";
     else if (diferencia != null && Math.abs(diferencia) > tol)
       nivel = Math.abs(diferencia) > tol * 3 ? "alta" : "media";
+    const difReal = sinContar ? null : diferencia;
 
     return {
       id: t.id,
@@ -1374,7 +1426,8 @@ export async function caja(pool, ctx, q) {
       libroSalidas: redondear(num(t.libroSalidas)),
       esperado,
       contado,
-      diferencia,
+      diferencia: difReal != null ? difReal : (sinContar ? null : diferencia),
+      diferenciaAxis: diferencia,
       difAxis,
       difCalc,
       nivel,
@@ -1407,12 +1460,11 @@ export async function caja(pool, ctx, q) {
   });
 
   const ventasTot = turnos.reduce((s, t) => s + t.ventas, 0);
-  const conDif = turnos.filter((t) => t.nivel === "media" || t.nivel === "alta");
+  const conDif = turnos.filter((t) => !t.sinContar && t.diferencia != null && Math.abs(t.diferencia) > tol);
   const paginas = Math.max(Math.ceil(turnos.length / 20), 1);
 
   const porCajeroMap = new Map();
   for (const t of turnos) {
-    if (t.diferencia == null) continue;
     const k = t.usuario || "Sin nombre";
     if (!porCajeroMap.has(k))
       porCajeroMap.set(k, {
@@ -1421,9 +1473,13 @@ export async function caja(pool, ctx, q) {
       });
     const c = porCajeroMap.get(k);
     c.turnos += 1;
+    if (t.sinContar) {
+      c.sinContar += 1;
+      continue; // no suma al faltante/sobrante del neto
+    }
+    if (t.diferencia == null) continue;
     c.totalDif += t.diferencia;
-    if (t.sinContar) c.sinContar += 1;
-    // DiffClose = esperado − contado → positivo = faltante (contó de menos)
+    // DiffClose = esperado − contado → positivo = faltante
     if (t.diferencia > 0.009) {
       c.faltante += t.diferencia;
       c.maxFaltante = Math.max(c.maxFaltante, t.diferencia);
@@ -1471,7 +1527,7 @@ export async function caja(pool, ctx, q) {
     sinCuadrar: turnos.filter((t) => Math.abs(t.difPagos) > 1 && t.ventas > 0).length,
     tolerancia: tol,
     nota:
-      "Esperado = fondo + libro de caja − retiro. Diferencia = DiffClose de Axis (esperado − contado). PriceOut ya incluye descuento.",
+      "Faltante/sobrante solo de turnos CON conteo físico. Los cierres sin contar no suman al neto (Axis deja DiffClose = esperado cuando contado=0).",
     formasPago: formas.map((x) => ({ socio: x.socio, tickets: num(x.tickets), total: num(x.total) })),
     porCajero,
     pagina,
@@ -1499,11 +1555,42 @@ export async function equipo(pool, ctx) {
   }));
 }
 
+export async function equipoModo(pool, ctx, q = {}) {
+  const modo = String(q.modo || "lista");
+  if (modo === "ranking") return rankingEquipo(pool, ctx);
+  if (modo === "productividad" || modo === "prod") return productividad(pool, ctx);
+  if (modo === "turnos" || modo === "horario") return turnosHorario(pool, ctx);
+  if (modo === "duracion") return duracionTurnos(pool, ctx);
+  return equipoCompleto(pool, ctx);
+}
+
 export async function equipoCompleto(pool, ctx) {
-  const lista = await equipo(pool, ctx);
-  const formas = await filas(pool, `SELECT COALESCE(p.Company,'Sin socio') AS socio, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total
-    FROM operations o LEFT JOIN partners p ON p.ID = o.PartnerID WHERE ${VENTA} AND ${RANGO} GROUP BY p.ID, p.Company ORDER BY total DESC`, [ctx.r.desde, ctx.r.hasta]);
-  return { cajeros: lista, socios: formas.map((x) => ({ socio: x.socio, tickets: num(x.tickets), total: num(x.total) })) };
+  const [lista, formas, cajaData] = await Promise.all([
+    equipo(pool, ctx),
+    filas(pool, `SELECT COALESCE(p.Company,'Sin socio') AS socio, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total
+      FROM operations o LEFT JOIN partners p ON p.ID = o.PartnerID WHERE ${VENTA} AND ${RANGO} GROUP BY p.ID, p.Company ORDER BY total DESC`, [ctx.r.desde, ctx.r.hasta]),
+    caja(pool, { ...ctx, uid: null }, { todo: true }).catch(() => ({ porCajero: [] })),
+  ]);
+  const cajaMap = new Map((cajaData.porCajero || []).map((c) => [c.usuario, c]));
+  const cajeros = lista.map((x) => {
+    const c = cajaMap.get(x.nombre) || {};
+    const señales = [];
+    if (num(c.faltante) > (ctx.aj?.tolCierre || 500) * 3) señales.push({ nivel: "alta", texto: "Faltante alto" });
+    if (num(c.sinContar) >= 2) señales.push({ nivel: "media", texto: `${c.sinContar} sin contar` });
+    if (num(c.conDif) >= 3) señales.push({ nivel: "media", texto: `${c.conDif} fuera tol.` });
+    return {
+      ...x,
+      faltante: num(c.faltante),
+      sobrante: num(c.sobrante),
+      sinContar: num(c.sinContar),
+      turnosDif: num(c.conDif),
+      señales,
+    };
+  });
+  return {
+    cajeros,
+    socios: formas.map((x) => ({ socio: x.socio, tickets: num(x.tickets), total: num(x.total) })),
+  };
 }
 
 // ---------- Inventario: alertas, ABC, compras ----------
@@ -1546,6 +1633,19 @@ export async function datosInventario(pool, ctx) {
   const v = { items, desde, hasta, totalImp };
   invCache = { t: Date.now(), clave, v };
   return v;
+}
+
+export async function inventarioModo(pool, ctx, q = {}) {
+  const modo = String(q.modo || "alertas");
+  if (modo === "abc") return analisisABC(pool, ctx, q);
+  if (modo === "compras") return sugerenciasCompra(pool, ctx);
+  if (modo === "antiguedad") return antiguedadStock(pool, ctx);
+  if (modo === "ipv") return ipv(pool, ctx, q);
+  if (modo === "traspasos") return traspasos(pool, ctx, q);
+  if (modo === "hechos" || modo === "traspasos-hechos") return traspasosHechos(pool, ctx, q);
+  if (modo === "existencias" || modo === "stock") return existencias(pool, ctx, q);
+  if (modo === "lista-arqueo" || modo === "arqueo") return listaArqueo(pool, ctx, q);
+  return alertasStock(pool, ctx);
 }
 
 export async function alertasStock(pool, ctx) {
@@ -1613,6 +1713,19 @@ export async function conteoAlertas(pool, ctx) {
 const NUM_TOTAL = "CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(l.Message, 'total: ', -1), ',', 1) AS DECIMAL(18,2))";
 const NUM_DESC = "CAST(SUBSTRING_INDEX(l.Message, ' a ', -1) AS DECIMAL(10,2))";
 const LOGF = "l.UserRealTime >= ? AND l.UserRealTime < DATE_ADD(?, INTERVAL 1 DAY)";
+
+/** Logs de Axis reutilizables (auditoría, informe, eventos). */
+async function logsAxis(pool, desde, hasta, condSql, limit = 80, extraParams = []) {
+  return filas(
+    pool,
+    `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje, l.UserID AS uid
+     FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+     WHERE ${LOGF} AND (${condSql})
+     ORDER BY l.UserRealTime DESC LIMIT ${Math.min(Math.max(limit, 1), 500)}`,
+    [desde, hasta, ...extraParams]
+  ).catch(() => []);
+}
+
 
 export async function anomalias(pool, ctx) {
   const { desde, hasta } = ctx.r;
@@ -1700,28 +1813,51 @@ export async function eventos(pool, ctx, q) {
   ]);
   const n = num(cuenta[0].n);
 
-  // Intentar extraer número de ticket/cuenta del mensaje para poder abrir la venta original
-  const filasOut = [];
-  for (const x of lista) {
+  // Extraer Acct/ticket del mensaje (varios formatos Axis) y resolver en lote
+  const parseAccts = (msg) => {
+    const s = String(msg || "");
+    const out = new Set();
+    // "venta 0000123456", "ticket 123456", "cuenta 123456", "#0000123456", números 5–12 dígitos
+    const re = /(?:venta|ticket|cuenta|acct|doc(?:umento)?|n[ºo°.]?\s*ticket)\s*[#:.]?\s*0*(\d{4,12})|\b0*(\d{5,12})\b|#0*(\d{4,12})\b/gi;
+    let m;
+    while ((m = re.exec(s))) {
+      const n = parseInt(m[1] || m[2] || m[3], 10);
+      if (n > 0) out.add(n);
+    }
+    return [...out];
+  };
+  const candidatos = new Set();
+  const porFila = lista.map((x) => {
     const msg = String(x.mensaje || "").replace(/\s+/g, " ");
-    // Buscar números largos que puedan ser Acct (tickets AxisPOS suelen ser numéricos)
-    const nums = (msg.match(/\b\d{5,12}\b/g) || []).map((s) => parseInt(s, 10)).filter((n) => n > 0);
-    let acct = null;
-    let ticketInfo = null;
-    if (nums.length) {
-      // Probar el último número largo del mensaje (suele ser el ticket)
-      for (const candidato of nums.reverse()) {
-        const t = await una(pool, `SELECT o.Acct AS acct, MAX(${F}) AS fecha, SUM(${IMP}) AS total, MAX(u.Name) AS cajero
-          FROM operations o LEFT JOIN users u ON u.ID = o.UserID
-          WHERE o.Acct = ? AND o.OperType IN (2, 34) GROUP BY o.Acct LIMIT 1`, [candidato]);
-        if (t && t.acct) {
-          acct = num(t.acct);
-          ticketInfo = { ticket: numTicket(acct), fecha: t.fecha, total: num(t.total), cajero: t.cajero };
-          break;
-        }
+    const nums = parseAccts(msg);
+    nums.forEach((n) => candidatos.add(n));
+    return { x, msg, nums };
+  });
+  const mapa = new Map();
+  if (candidatos.size) {
+    const ids = [...candidatos].slice(0, 80);
+    const ph = ids.map(() => "?").join(",");
+    const rows = await filas(
+      pool,
+      `SELECT o.Acct AS acct, MAX(${F}) AS fecha, SUM(${IMP}) AS total, MAX(u.Name) AS cajero
+       FROM operations o LEFT JOIN users u ON u.ID = o.UserID
+       WHERE o.Acct IN (${ph}) AND o.OperType IN (2, 34)
+       GROUP BY o.Acct`,
+      ids
+    ).catch(() => []);
+    for (const r of rows) mapa.set(num(r.acct), r);
+  }
+  const filasOut = porFila.map(({ x, msg, nums }) => {
+    let acct = null, ticketInfo = null;
+    for (const c of nums) {
+      const t = mapa.get(c);
+      if (t) {
+        acct = num(t.acct);
+        ticketInfo = { ticket: numTicket(acct), fecha: t.fecha, total: num(t.total), cajero: t.cajero };
+        break;
       }
     }
-    filasOut.push({
+    return {
       id: x.id,
       fecha: x.fecha,
       usuario: x.usuario || "—",
@@ -1730,8 +1866,8 @@ export async function eventos(pool, ctx, q) {
       ticket: ticketInfo ? ticketInfo.ticket : null,
       ticketTotal: ticketInfo ? ticketInfo.total : null,
       ticketFecha: ticketInfo ? ticketInfo.fecha : null,
-    });
-  }
+    };
+  });
   return { total: n, paginas: Math.max(Math.ceil(n / 30), 1), pagina, filas: filasOut };
 }
 
@@ -1791,242 +1927,77 @@ export async function conteoPerdidas(pool, ctx) {
 
 // ---------- Auditoría detallada del negocio ----------
 export async function auditoria(pool, ctx) {
-  const { desde, hasta } = ctx.r;
-  const aj = ctx.aj;
-  const P = [desde, hasta];
-
-  const [anom, cajaData, ticketsGrandes, descAltos, porHoraNoche, cancelDia, resumenVentas, topCanceladores] =
-    await Promise.all([
-      anomalias(pool, ctx),
-      caja(pool, { ...ctx, uid: null }, { todo: true }),
-      filas(
-        pool,
-        `SELECT o.Acct AS acct, MAX(${F}) AS fecha, SUM(${IMP}) AS total, MAX(u.Name) AS cajero, COUNT(*) AS lineas
-         FROM operations o LEFT JOIN users u ON u.ID = o.UserID
-         WHERE ${VENTA} AND ${RANGO}
-         GROUP BY o.Acct HAVING SUM(${IMP}) >= ?
-         ORDER BY total DESC LIMIT 25`,
-        [...P, Math.max(aj.umbralCancel || 100000, 50000)]
-      ),
-      filas(
-        pool,
-        `SELECT o.Acct AS acct, MAX(${F}) AS fecha, g.Name AS nombre, ABS(o.Qtty) AS cant,
-                o.PriceOut AS precio, IF(o.Discount BETWEEN 0 AND 100, o.Discount, 0) AS descuento,
-                ${IMP} AS importe, u.Name AS cajero
-         FROM operations o
-         LEFT JOIN goods g ON g.ID = o.GoodID
-         LEFT JOIN users u ON u.ID = o.UserID
-         WHERE ${VENTA} AND ${RANGO} AND IF(o.Discount BETWEEN 0 AND 100, o.Discount, 0) >= ?
-         ORDER BY descuento DESC, ${F} DESC LIMIT 40`,
-        [...P, aj.descMax || 20]
-      ),
-      filas(
-        pool,
-        `SELECT HOUR(${F}) AS hora, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total
-         FROM operations o WHERE ${VENTA} AND ${RANGO}
-           AND (HOUR(${F}) < 7 OR HOUR(${F}) >= 21)
-         GROUP BY hora ORDER BY hora`,
-        P
-      ),
-      filas(
-        pool,
-        `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d') AS dia, COUNT(*) AS n
-         FROM applicationlog l
-         WHERE ${LOGF} AND (l.Message LIKE '%operación cancelada%' OR l.Message LIKE 'Anular venta%')
-         GROUP BY dia ORDER BY dia DESC LIMIT 30`,
-        P
-      ),
-      una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} AND ${RANGO}`, P),
-      filas(
-        pool,
-        `SELECT u.Name AS nombre, l.UserID AS id, COUNT(*) AS n
-         FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
-         WHERE ${LOGF} AND (l.Message LIKE '%operación cancelada%' OR l.Message LIKE 'Anular venta%')
-         GROUP BY l.UserID, u.Name ORDER BY n DESC LIMIT 10`,
-        P
-      ),
-    ]);
-
-  const cajaPorUser = new Map();
-  for (const t of cajaData.filas || []) {
-    const k = t.usuario || "Sin nombre";
-    if (!cajaPorUser.has(k)) cajaPorUser.set(k, { faltante: 0, sobrante: 0, turnos: 0, conDif: 0 });
-    const c = cajaPorUser.get(k);
-    c.turnos += 1;
-    if (t.diferencia != null) {
-      if (t.diferencia < 0) c.faltante += t.diferencia;
-      if (t.diferencia > 0) c.sobrante += t.diferencia;
-      if (t.nivel === "media" || t.nivel === "alta") c.conDif += 1;
-    }
-  }
-
-  const scorecard = (anom.usuarios || [])
-    .map((u) => {
-      const cj = cajaPorUser.get(u.nombre) || { faltante: 0, sobrante: 0, turnos: 0, conDif: 0 };
-      const riesgo =
-        u.flags.filter((f) => f.nivel === "alta").length * 3 +
-        u.flags.filter((f) => f.nivel === "media").length +
-        (cj.conDif > 2 ? 2 : 0) +
-        (Math.abs(cj.faltante) > (aj.tolCierre || 500) * 5 ? 2 : 0);
-      return {
-        id: u.id,
-        nombre: u.nombre,
-        tickets: u.tickets,
-        cancel: u.cancel,
-        anuladas: u.anuladas,
-        lineasElim: u.lineasElim,
-        descAltos: u.descAltos,
-        devoluciones: u.devoluciones,
-        tasaCancel: u.tasaCancel,
-        tasaDev: u.tasaDev,
-        flags: u.flags,
-        cajaFaltante: redondear(cj.faltante),
-        cajaSobrante: redondear(cj.sobrante),
-        cajaTurnos: cj.turnos,
-        cajaConDif: cj.conDif,
-        riesgo,
-        nivel: riesgo >= 8 ? "alta" : riesgo >= 4 ? "media" : "ok",
-      };
-    })
-    .sort((a, b) => b.riesgo - a.riesgo);
-
-  // Detalle de logs: precios, anulaciones, cancelaciones, devoluciones
-  const [cambiosPrecio, anulacionesLog, cancelacionesLog, devolucionesOps] = await Promise.all([
-    filas(
-      pool,
-      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
-       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
-       WHERE ${LOGF} AND (l.Message LIKE '%precio de venta%' OR l.Message LIKE '%antiguo precio%' OR l.Message LIKE '%modificado la mercanc%')
-       ORDER BY l.UserRealTime DESC LIMIT 60`,
-      P
-    ).catch(() => []),
-    filas(
-      pool,
-      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
-       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
-       WHERE ${LOGF} AND (l.Message LIKE 'Anular venta%' OR l.Message LIKE '%Anular venta%' OR l.Message LIKE '%anulada%')
-       ORDER BY l.UserRealTime DESC LIMIT 60`,
-      P
-    ).catch(() => []),
-    filas(
-      pool,
-      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
-       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
-       WHERE ${LOGF} AND l.Message LIKE '%operación cancelada%'
-       ORDER BY l.UserRealTime DESC LIMIT 60`,
-      P
-    ).catch(() => []),
-    filas(
-      pool,
-      `SELECT o.Acct AS acct, MAX(${F}) AS fecha, SUM(${IMP}) AS total, MAX(u.Name) AS cajero, COUNT(*) AS lineas
-       FROM operations o LEFT JOIN users u ON u.ID = o.UserID
-       WHERE ${DEVOL} AND ${RANGO}
-       GROUP BY o.Acct ORDER BY fecha DESC LIMIT 40`,
-      P
-    ).catch(() => []),
-  ]);
-
-  const hallazgos = [];
-  if (anom.totales.alta > 0)
-    hallazgos.push({
-      nivel: "alta",
-      titulo: `${anom.totales.alta} alerta(s) alta(s) de comportamiento`,
-      texto: "Hay cajeros con cancelaciones, anulaciones o descuentos fuera de lo normal. Revisa el scorecard.",
-    });
-  if (cajaData.faltante < -(aj.tolCierre || 500) * 3)
-    hallazgos.push({
-      nivel: "alta",
-      titulo: `Faltante de caja acumulado: ${Math.round(cajaData.faltante)} CUP`,
-      texto: "El dinero contado al cierre está por debajo de lo esperado en varios turnos.",
-    });
-  if (cajaData.sobrante > (aj.tolCierre || 500) * 10)
-    hallazgos.push({
-      nivel: "media",
-      titulo: `Sobrante de caja muy alto: +${Math.round(cajaData.sobrante)} CUP`,
-      texto: "Puede indicar fondos iniciales mal registrados, retiros no apuntados o contados que mezclan formas de pago.",
-    });
-  if ((cajaData.sinCuadrar || 0) > 5)
-    hallazgos.push({
-      nivel: "media",
-      titulo: `${cajaData.sinCuadrar} turnos sin cuadrar ventas vs cobros`,
-      texto: "Las ventas del sistema no coinciden con los pagos registrados.",
-    });
-  if (descAltos.length >= 10)
-    hallazgos.push({
-      nivel: "media",
-      titulo: `${descAltos.length} líneas con descuento ≥ ${aj.descMax} %`,
-      texto: "Revisa si los descuentos altos están autorizados.",
-    });
-  if (porHoraNoche.length)
-    hallazgos.push({
-      nivel: "media",
-      titulo: "Ventas fuera de horario (antes de 7:00 o desde 21:00)",
-      texto: `${porHoraNoche.reduce((s, x) => s + num(x.tickets), 0)} tickets en horario atípico.`,
-    });
-  if (!hallazgos.length)
-    hallazgos.push({
-      nivel: "ok",
-      titulo: "Sin alertas prioritarias en este período",
-      texto: "No hay señales fuertes; igual conviene revisar el scorecard y la caja.",
-    });
-
+  // Vista unificada: reutiliza el informe completo y expone el subconjunto "resumen"
+  const full = await informeAuditoria(pool, ctx);
+  const r = full.resumenEjecutivo || {};
+  const det = full.detalle || {};
+  const scorecard = (full.fichasTrabajadores || []).map((f) => ({
+    id: f.id,
+    nombre: f.nombre,
+    ventas: f.ventas,
+    tickets: f.tickets,
+    anulaciones: f.anulaciones,
+    cancelaciones: f.cancelaciones,
+    devoluciones: f.devoluciones,
+    faltante: f.faltante,
+    sobrante: f.sobrante,
+    turnosDif: f.turnosDif,
+    sinContar: f.sinContar,
+    riesgo: f.señales?.some((s) => s.nivel === "alta") ? 3 : f.señales?.some((s) => s.nivel === "media") ? 1 : 0,
+    señales: f.señales || [],
+  }));
   return {
-    desde,
-    hasta,
-    hallazgos,
+    desde: full.meta?.desde,
+    hasta: full.meta?.hasta,
+    hallazgos: full.hallazgos || [],
     scorecard,
     caja: {
-      faltante: cajaData.faltante,
-      sobrante: cajaData.sobrante,
-      conDiferencia: cajaData.conDiferencia,
-      sinCuadrar: cajaData.sinCuadrar,
-      turnos: cajaData.turnos,
-      porCajero: cajaData.porCajero || [],
+      faltante: r.faltante || 0,
+      sobrante: r.sobrante || 0,
+      conDiferencia: r.turnosFueraTol || 0,
+      sinCuadrar: 0,
+      turnos: r.turnos || 0,
+      porCajero: (full.fichasTrabajadores || []).map((f) => ({
+        usuario: f.nombre,
+        turnos: f.turnos,
+        conDif: f.turnosDif,
+        faltante: f.faltante,
+        sobrante: f.sobrante,
+        sinContar: f.sinContar,
+      })),
     },
-    ticketsGrandes: ticketsGrandes.map((x) => ({
-      acct: num(x.acct),
-      ticket: numTicket(x.acct),
-      fecha: x.fecha,
-      total: num(x.total),
-      cajero: x.cajero || "",
-      lineas: num(x.lineas),
-    })),
-    descuentosAltos: descAltos.map((x) => ({
-      acct: num(x.acct),
-      ticket: numTicket(x.acct),
-      fecha: x.fecha,
-      nombre: x.nombre,
-      cant: num(x.cant),
-      descuento: num(x.descuento),
-      importe: num(x.importe),
-      cajero: x.cajero || "",
-    })),
-    fueraHorario: porHoraNoche.map((x) => ({ hora: num(x.hora), tickets: num(x.tickets), total: num(x.total) })),
-        cancelacionesPorDia: cancelDia.map((x) => ({ dia: x.dia, n: num(x.n) })),
-    topCanceladores: topCanceladores.map((x) => ({ id: num(x.id), nombre: x.nombre || "—", n: num(x.n) })),
-    ventas: { total: num(resumenVentas.total), tickets: num(resumenVentas.tickets) },
-    cambiosPrecio: cambiosPrecio.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
-    anulaciones: anulacionesLog.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
-    cancelaciones: cancelacionesLog.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
-    devolucionesDetalle: devolucionesOps.map((x) => ({
-      acct: num(x.acct), ticket: numTicket(x.acct), fecha: x.fecha, total: num(x.total),
-      cajero: x.cajero || "", lineas: num(x.lineas),
-    })),
+    ticketsGrandes: (det.turnosConDiferencia || []).slice(0, 0), // reservado
+    descuentosAltos: [],
+    fueraHorario: [],
+    cancelacionesPorDia: [],
+    topCanceladores: (full.fichasTrabajadores || [])
+      .filter((f) => f.anulaciones + f.cancelaciones > 0)
+      .map((f) => ({ id: f.id, nombre: f.nombre, n: f.anulaciones + f.cancelaciones }))
+      .sort((a, b) => b.n - a.n)
+      .slice(0, 10),
+    ventas: { total: r.ventas || 0, tickets: r.tickets || 0 },
+    cambiosPrecio: det.cambiosPrecio || [],
+    anulaciones: det.anulaciones || [],
+    cancelaciones: det.cancelaciones || [],
+    devolucionesDetalle: det.consumoCasa ? [] : [],
     contadores: {
-      cambiosPrecio: cambiosPrecio.length,
-      anulaciones: anulacionesLog.length,
-      cancelaciones: cancelacionesLog.length,
-      devoluciones: devolucionesOps.length,
-      descuentosAltos: descAltos.length,
-      turnosConDif: cajaData.conDiferencia || 0,
+      cambiosPrecio: (det.cambiosPrecio || []).length,
+      anulaciones: (det.anulaciones || []).length,
+      cancelaciones: (det.cancelaciones || []).length,
+      devoluciones: (det.devolucionesDetalle || []).length,
+      descuentosAltos: 0,
+      turnosConDif: r.turnosFueraTol || 0,
     },
-    umbrales: { descMax: aj.descMax, umbralCancel: aj.umbralCancel, tolCierre: aj.tolCierre },
-    notaCaja: cajaData.nota || "Descuadre basado en DiffClose de AxisPOS (solo efectivo).",
+    umbrales: {
+      descMax: ctx.aj?.descMax ?? 20,
+      umbralCancel: ctx.aj?.umbralCancel ?? 100000,
+      tolCierre: ctx.aj?.tolCierre ?? 500,
+    },
+    notaCaja: "Unificado con Informe de auditoría. Faltante/sobrante solo con conteo físico.",
+    informe: full,
   };
-
 }
 
-// ---------- Usuarios de AxisPOS (para PIN y roles) ----------
 export async function usuariosAxis(pool) {
   const l = await filas(
     pool,
@@ -2341,22 +2312,35 @@ export async function traspasosHechos(pool, ctx, q = {}) {
 export async function stockVivo(pool) {
   const lista = await filas(
     pool,
-    `SELECT g.ID AS id, g.Code AS sku, g.Name AS nombre, ${PRECIO} AS precio, COALESCE(SUM(s.Qtty),0) AS stock
+    `SELECT g.ID AS id, g.Code AS sku, g.Name AS nombre, ${PRECIO} AS precio, COALESCE(SUM(s.Qtty),0) AS stock,
+            g.BarCode1 AS barcode
      FROM goods g
      LEFT JOIN store s ON s.GoodID = g.ID
      WHERE COALESCE(g.Deleted,0)=0
-     GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3
-     HAVING ABS(COALESCE(SUM(s.Qtty),0)) > 0.0005 OR 1=1
+     GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.BarCode1
      ORDER BY g.Name
      LIMIT 20000`
   );
   const items = lista.map((x) => ({
+    id: num(x.id),
     sku: x.sku || String(x.id),
+    codigo: x.sku || String(x.id),
+    barcode: x.barcode || "",
     nombre: x.nombre,
     stock: num(x.stock),
+    existencia: num(x.stock),
     precio: num(x.precio),
   }));
-  return { items, n: items.length, ts: Date.now() };
+  // Varios formatos: Arqueo Stock / clientes antiguos
+  return {
+    ok: true,
+    items,
+    productos: items,
+    catalogo: { cargado: true, n: items.length, items },
+    n: items.length,
+    total: items.length,
+    ts: Date.now(),
+  };
 }
 
 /** Compara conteo físico (JSON de Arqueo) con stock del sistema. */
@@ -2780,25 +2764,16 @@ export async function ajustesSugeridos(pool, ctx, body) {
 }
 
 export async function rankingEquipo(pool, ctx) {
-  const [prod, cajaData, pat] = await Promise.all([
-    productividad(pool, ctx),
-    caja(pool, ctx, { pagina: 1, todo: 1 }).catch(() => ({ porCajero: [] })),
-    patronesAnulacion(pool, ctx).catch(() => ({ porUsuario: [] })),
-  ]);
-  const anMap = Object.fromEntries((pat.porUsuario || []).map((x) => [x.usuario, x.n]));
-  const cajaMap = Object.fromEntries((cajaData.porCajero || []).map((x) => [x.usuario, x]));
-  const filas = (prod.filas || []).map((x) => {
-    const señales = [];
-    const c = cajaMap[x.usuario];
-    if (c && c.faltante < -ctx.aj.tolCierre) señales.push({ nivel: "alta", texto: `Faltante caja ${Math.abs(c.faltante).toFixed(0)} CUP` });
-    if (c && c.conDif >= 3) señales.push({ nivel: "media", texto: `${c.conDif} turnos fuera de tolerancia` });
-    const an = anMap[x.usuario] || 0;
-    if (an >= 5) señales.push({ nivel: "media", texto: `${an} anulaciones/cancelaciones` });
-    if (x.ticketsHora != null && x.ticketsHora < 2 && x.horas > 4) señales.push({ nivel: "media", texto: "Baja productividad (tickets/h)" });
-    return { ...x, señales, nSenales: señales.length };
-  });
-  filas.sort((a, b) => b.nSenales - a.nSenales || (b.ventasHora || 0) - (a.ventasHora || 0));
-  return { desde: ctx.r.desde, hasta: ctx.r.hasta, filas };
+  const d = await equipoCompleto(pool, ctx);
+  const filasOut = (d.cajeros || []).map((x) => ({
+    usuario: x.nombre,
+    ventasHora: null,
+    ticketsHora: null,
+    ventas: x.total,
+    tickets: x.tickets,
+    señales: x.señales || [],
+  })).sort((a, b) => b.ventas - a.ventas);
+  return { filas: filasOut };
 }
 
 export async function turnosHorario(pool, ctx) {
@@ -2884,11 +2859,16 @@ export async function busquedaGlobal(pool, ctx, q) {
 }
 
 /** Informe formal de auditoría (resumen ejecutivo, hallazgos, fichas, anexos). */
+const informeCache = { t: 0, k: "", v: null };
 export async function informeAuditoria(pool, ctx) {
   const { desde, hasta } = ctx.r;
   const aj = ctx.aj || {};
   const tol = num(aj.tolCierre) || 500;
   const P = [desde, hasta];
+  const ck = `${desde}|${hasta}|${ctx.uid || ""}|${tol}`;
+  if (informeCache.v && informeCache.k === ck && Date.now() - informeCache.t < 45000) {
+    return informeCache.v;
+  }
 
   const [
     cajaData,
@@ -3199,7 +3179,7 @@ export async function informeAuditoria(pool, ctx) {
 
   const netoComunal = redondear((cajaData.faltante || 0) - (cajaData.sobrante || 0));
 
-  return {
+  const out = {
     meta: {
       titulo: "Informe de auditoría operativa",
       desde,
@@ -3237,7 +3217,7 @@ export async function informeAuditoria(pool, ctx) {
       texto:
         `Período ${desde} a ${hasta}. Ventas ${Math.round(num(ventasRes.total))} CUP en ${num(ventasRes.tickets)} tickets. ` +
         `Efectivo: faltante ${Math.round(cajaData.faltante || 0)} / sobrante ${Math.round(cajaData.sobrante || 0)} ` +
-        `(neto comunal ${Math.round(netoComunal)}). ` +
+        `(neto ${Math.round(netoComunal)}). ` +
         `${parciales.length} cierres sin conteo, ${tarjetaSinBanco.length} tickets tarjeta a conciliar con banco, ` +
         `${anulaciones.length} anulaciones en log, ${stockNeg.length} SKU en negativo.`,
     },
@@ -3307,7 +3287,7 @@ export async function informeAuditoria(pool, ctx) {
           `Anulaciones ${f.anulaciones}, cancelaciones ${f.cancelaciones}, ` +
           `devoluciones ${Math.round(f.devoluciones)} CUP. ` +
           `Caja: faltante ${Math.round(f.faltante)}, sobrante ${Math.round(f.sobrante)}, ` +
-          `neto comunal ${Math.round(f.netoComunal)}, cierres sin contar ${f.sinContar}.`,
+          `neto ${Math.round(f.netoComunal)}, cierres sin contar ${f.sinContar}.`,
         señales: f.señales,
       })),
     recomendaciones,
@@ -3320,4 +3300,8 @@ export async function informeAuditoria(pool, ctx) {
       "Este informe es de lectura sobre la base; no modifica datos ni sustituye auditoría contable formal.",
     ],
   };
+  informeCache.t = Date.now();
+  informeCache.k = ck;
+  informeCache.v = out;
+  return out;
 }

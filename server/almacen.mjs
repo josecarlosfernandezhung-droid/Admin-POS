@@ -144,9 +144,10 @@ export function rolDe(id, nivel) {
 }
 
 export const PERMISOS = {
-  admin: ["resumen", "ventas", "productos", "existencias", "caja", "equipo", "inventario", "perdidas", "ajustes", "ayuda"],
-  gerente: ["resumen", "ventas", "productos", "existencias", "caja", "equipo", "inventario", "perdidas", "ayuda"],
-  cajero: ["resumen", "ventas", "productos", "existencias", "caja", "ayuda"],
+  // Menú compacto + claves legadas (productos/existencias) por compatibilidad
+  admin: ["resumen", "ventas", "caja", "equipo", "inventario", "perdidas", "ajustes", "ayuda", "productos", "existencias"],
+  gerente: ["resumen", "ventas", "caja", "equipo", "inventario", "perdidas", "ayuda", "productos", "existencias"],
+  cajero: ["resumen", "ventas", "caja", "ayuda", "productos", "existencias", "inventario"],
 };
 
 // --- Sesiones con PIN (en memoria) ---

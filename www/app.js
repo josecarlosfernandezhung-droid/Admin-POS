@@ -342,8 +342,11 @@ function entrarApp() {
         <button class="btn sec chico" data-act="toggleTema" id="btnTema" title="Cambiar tema claro/oscuro">${LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro"}</button>
         <button class="btn sec chico" data-act="prefsUI" title="Preferencias">Aa</button>
         <span id="rango-custom" class="rango-custom" ${S.periodo === "custom" ? "" : "hidden"}>
-          <input type="date" id="desde" value="${e(S.desde)}" data-in="fechaDesde">
-          <span>–</span>
+          <input type="date" id="desde" value="${e(S.desde)}" data-in="fechaDesde" title="Desde">
+          <span class="muted">–</span>
+          <input type="date" id="hasta" value="${e(S.hasta)}" data-in="fechaHasta" title="Hasta">
+          <button type="button" class="btn sec chico" data-act="aplicarFechas" title="Aplicar rango">Aplicar</button>
+        </span>
           <input type="date" id="hasta" value="${e(S.hasta)}" data-in="fechaHasta">
           <button class="btn sec" data-act="aplicarFechas" style="padding:6px 10px;font-size:.82rem">Ver</button>
         </span>
@@ -1129,9 +1132,131 @@ vistas.inventario = async () => {
 const TIPOS_EV = [["cancel", "Cancelaciones"], ["anular", "Anulaciones"], ["elim", "Líneas quitadas"], ["desc", "Descuentos"], ["precio", "Cambios de precio"], ["cierre", "Cierres de caja"], ["login", "Accesos fallidos"], ["cajon", "Cajón abierto"], ["todo", "Todos los logs"]];
 vistas.perdidas = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["auditoria", "Auditoría"], ["alertas", "Alertas"], ["mermas", "Mermas"], ["devoluciones", "Devoluciones"], ["patrones", "Patrones anulación"], ["eventos", "Eventos"]], S.perSub, "perSub");
+  const tabs = subTabs([["informe", "Informe"], ["auditoria", "Auditoría"], ["alertas", "Alertas"], ["mermas", "Mermas"], ["devoluciones", "Devoluciones"], ["patrones", "Patrones anulación"], ["eventos", "Eventos"]], S.perSub, "perSub");
   let cuerpo = "";
-  if (S.perSub === "auditoria") {
+  if (S.perSub === "informe") {
+    const d = await get("/api/informe-auditoria", paramsPeriodo());
+    if (!aqui(tk)) return;
+    const m = d.meta || {};
+    const r = d.resumenEjecutivo || {};
+    const det = d.detalle || {};
+    const sec = (titulo, body) => `<div class="tarjeta"><h3>${titulo}</h3>${body}</div>`;
+    const mismoDia = m.desde && m.hasta && m.desde === m.hasta;
+    cuerpo = `
+      <div class="tarjeta" style="border-left:3px solid var(--azul,#2563eb)">
+        <p style="margin:0;font-size:.9rem"><b>Período del informe:</b> ${mismoDia ? "día " + e(m.desde) : e(m.desde) + " → " + e(m.hasta)}</p>
+        <p class="muted" style="margin:6px 0 0;font-size:.82rem">Arriba elige <b>Hoy</b>, <b>7 días</b>… o <b>Fechas</b>, pon el día (desde = hasta = ese día) y pulsa <b>Aplicar</b>.</p>
+      </div>
+      ${sec("1. Resumen ejecutivo", `
+        <p style="margin:0 0 10px;line-height:1.45">${e(r.texto || "")}</p>
+        <div class="kpis">
+          <div class="kpi"><span>Ventas</span><b class="num">${cup(r.ventas)}</b><small>${fmt(r.tickets,0)} tickets</small></div>
+          <div class="kpi"><span>Faltante</span><b class="num" style="color:var(--rojo)">${cup(r.faltante)}</b></div>
+          <div class="kpi"><span>Sobrante</span><b class="num" style="color:var(--verde)">${cup(r.sobrante)}</b></div>
+          <div class="kpi"><span>Neto comunal</span><b class="num">${cup(r.netoComunal)}</b></div>
+          <div class="kpi"><span>Sin contar / tarjeta</span><b class="num">${fmt(r.cerradosSinContar,0)} / ${fmt(r.ticketsTarjeta,0)}</b></div>
+          <div class="kpi"><span>Stock negativo</span><b class="num">${fmt(r.stockNegativo,0)}</b></div>
+        </div>
+        <p class="muted" style="font-size:.82rem;margin:8px 0 0">Período ${e(m.desde)} – ${e(m.hasta)} · tolerancia caja ${fmt(m.toleranciaCaja,0)} CUP</p>
+      `)}
+      ${sec("2. Alcance, fuentes y método", `
+        <p><b>Fuentes</b></p><ul>${(m.fuentes||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ul>
+        <p><b>Método</b></p><ul>${(m.metodo||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ul>
+      `)}
+      ${sec("3. Hallazgos detallados", `
+        ${(d.hallazgos||[]).map((h)=>`<div class="fila"><span class="etiqueta et-${h.nivel==="ok"?"ok":h.nivel==="alta"?"alta":"media"}">${e(h.nivel)}</span>
+          <div style="margin-left:8px"><b>${e(h.titulo)}</b><small>${e(h.texto)}</small></div></div>`).join("")}
+      `)}
+      ${sec("4. Tickets por tarjeta (conciliar con banco)", `
+        <p class="muted" style="font-size:.84rem">Axis registra el cobro tarjeta; Admin POS no ve el banco. Cruza estos montos con el extracto.</p>
+        <div class="scroll"><table><tr><th>Turno</th><th>Ticket</th><th>Cajero</th><th>Local</th><th class="d">Monto</th></tr>
+        ${(det.tarjetaSinBanco||[]).map((x)=>`<tr class="clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer">
+          <td class="num">${e(x.turno||"")}</td><td class="link num">${x.ticket}</td><td>${e(x.cajero)}</td><td>${e(x.local)}</td><td class="d num">${cup(x.monto)}</td></tr>`).join("")
+          || '<tr><td colspan="5" class="muted">Ninguno en el período</td></tr>'}
+        </table></div>
+      `)}
+      ${sec("5. Parcial / cierre como cuenta a casa $0", `
+        <div class="scroll"><table><tr><th>Apertura</th><th>Quién</th><th class="d">Libro</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">DiffClose</th></tr>
+        ${(det.parcialesCero||[]).map((t)=>`<tr>
+          <td class="num">${fechaHora(t.apertura)}</td><td>${e(t.usuario||"")}</td>
+          <td class="d num">${cup(t.libroCaja||0)}</td><td class="d num">${cup(t.esperado)}</td>
+          <td class="d num">${cup(t.contado)}</td><td class="d num">${cup(t.diferencia)}</td></tr>`).join("")
+          || '<tr><td colspan="6" class="muted">Ningún cierre sin conteo</td></tr>'}
+        </table></div>
+      `)}
+      ${sec("6. Anulaciones de ventas", `
+        ${(det.anulaciones||[]).slice(0,40).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
+          || '<p class="muted">Sin anulaciones en el log</p>'}
+      `)}
+      ${sec("7. Consumo de la casa", `
+        <div class="scroll"><table><tr><th>Cuándo</th><th>Producto</th><th>Usuario</th><th>Socio</th><th class="d">Cant.</th><th class="d">Importe</th></tr>
+        ${(det.consumoCasa||[]).map((x)=>`<tr>
+          <td class="num">${fechaHora(x.fecha)}</td><td>${e(x.producto)}<small>${e(x.nota||"")}</small></td>
+          <td>${e(x.usuario)}</td><td>${e(x.socio)}</td>
+          <td class="d num">${fmt(x.cant,1)}</td><td class="d num">${cup(x.importe)}</td></tr>`).join("")
+          || '<tr><td colspan="6" class="muted">Sin movimientos detectados como casa/consumo</td></tr>'}
+        </table></div>
+      `)}
+      ${sec("8. Inventario y precios", `
+        <h4 style="margin:0 0 6px">Stock negativo</h4>
+        <div class="scroll"><table><tr><th>Código</th><th>Producto</th><th class="d">Stock</th><th class="d">Precio</th></tr>
+        ${(det.stockNegativo||[]).map((x)=>`<tr><td class="muted">${e(x.codigo)}</td><td>${e(x.nombre)}</td>
+          <td class="d num" style="color:var(--rojo)">${fmt(x.stock,2)}</td><td class="d num">${cup(x.precio)}</td></tr>`).join("")
+          || '<tr><td colspan="4" class="muted">Sin stock negativo</td></tr>'}
+        </table></div>
+        <h4 style="margin:12px 0 6px">Cambios de precio</h4>
+        ${(det.cambiosPrecio||[]).slice(0,30).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
+          || '<p class="muted">Sin cambios de precio</p>'}
+        <h4 style="margin:12px 0 6px">Productos / líneas eliminadas (log)</h4>
+        ${(det.productosEliminados||[]).slice(0,25).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
+          || '<p class="muted">Sin eliminaciones en el log</p>'}
+      `)}
+      ${sec("9. Conclusiones por persona", `
+        ${(d.conclusionesPorPersona||[]).map((c)=>`<div class="fila" style="align-items:flex-start">
+          <div><b>${e(c.nombre)}</b><small>${e(c.resumen)}</small>
+          <div style="margin-top:4px">${(c.señales||[]).map((s)=>`<span class="etiqueta et-${s.nivel==="ok"?"ok":s.nivel==="alta"?"alta":"media"}">${e(s.texto)}</span> `).join("")}</div>
+          </div></div>`).join("") || '<p class="muted">Sin datos de personal</p>'}
+      `)}
+      ${sec("10. Fichas de trabajadores", `
+        <div class="scroll"><table>
+          <tr><th>Nombre</th><th class="d">Ventas</th><th class="d">Tickets</th><th class="d">Anul.</th><th class="d">Cancel.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Comunal</th><th class="d">Sin contar</th></tr>
+          ${(d.fichasTrabajadores||[]).map((f)=>`<tr>
+            <td>${e(f.nombre)}</td>
+            <td class="d num">${compacto(f.ventas)}</td>
+            <td class="d num">${fmt(f.tickets,0)}</td>
+            <td class="d num">${fmt(f.anulaciones,0)}</td>
+            <td class="d num">${fmt(f.cancelaciones,0)}</td>
+            <td class="d num" style="color:var(--rojo)">${f.faltante?cup(f.faltante):"—"}</td>
+            <td class="d num" style="color:var(--verde)">${f.sobrante?cup(f.sobrante):"—"}</td>
+            <td class="d num">${cup(f.netoComunal)}</td>
+            <td class="d num">${fmt(f.sinContar,0)}</td>
+          </tr>`).join("")}
+        </table></div>
+      `)}
+      ${sec("11. Evidencia parcial vs final / arqueos con ajuste", `
+        <h4 style="margin:0 0 6px">Log (parcial, final, cierre, reconteo)</h4>
+        ${(det.evidenciasParcialFinal||[]).slice(0,40).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
+          || '<p class="muted">Sin mensajes de este tipo</p>'}
+        <h4 style="margin:12px 0 6px">Arqueos / ajustes en log</h4>
+        ${(det.arqueosAjustes||[]).slice(0,30).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
+          || '<p class="muted">Sin entradas</p>'}
+        <h4 style="margin:12px 0 6px">Turnos fuera de tolerancia</h4>
+        <div class="scroll"><table><tr><th>Apertura</th><th>Quién</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Dif.</th></tr>
+        ${(det.turnosConDiferencia||[]).map((t)=>`<tr>
+          <td class="num">${fechaHora(t.apertura)}</td><td>${e(t.usuario||"")}</td>
+          <td class="d num">${cup(t.esperado)}</td><td class="d num">${cup(t.contado)}</td>
+          <td class="d num">${cup(t.diferencia)}</td></tr>`).join("")
+          || '<tr><td colspan="5" class="muted">Ninguno</td></tr>'}
+        </table></div>
+      `)}
+      ${sec("12. Recomendaciones", `<ol>${(d.recomendaciones||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ol>`)}
+      ${sec("13. Limitaciones y anexos", `
+        <ul>${(d.limitaciones||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ul>
+        <p class="muted" style="font-size:.84rem">Anexo sugerido: exportar este período + backup .woback + extracto bancario de los días con tarjeta.</p>
+      `)}
+    `;
+  } else if (S.perSub === "auditoria") {
+
     const d = await get("/api/auditoria", paramsPeriodo());
     if (!aqui(tk)) return;
     const nv = (n) => (n === "alta" ? "alta" : n === "media" ? "media" : "ok");
@@ -1421,8 +1546,32 @@ const ACC = {
     S.ventas.pagina = S.prod.pagina = S.exis.pagina = S.cajaPag = S.ev.pagina = 1;
     marcarNav();
     if (S.periodo === "custom") {
-      if (!S.desde || !S.hasta) return;
+      // Si no hay fechas, poner un solo día (último con datos o hoy)
+      const hoy = new Date();
+      const ymd = (d) => d.toISOString().slice(0, 10);
+      if (!S.desde) S.desde = S.estado?.ultimoDia || ymd(hoy);
+      if (!S.hasta) S.hasta = S.desde;
+      const rc = document.getElementById("rango-custom");
+      if (rc) rc.hidden = false;
+      const id = document.getElementById("desde");
+      const ih = document.getElementById("hasta");
+      if (id) id.value = S.desde;
+      if (ih) ih.value = S.hasta;
+      // Espera a que el usuario elija / pulse Aplicar si quiere otro día
     }
+    vista();
+  },
+  aplicarFechas: () => {
+    const id = document.getElementById("desde");
+    const ih = document.getElementById("hasta");
+    if (id?.value) S.desde = id.value;
+    if (ih?.value) S.hasta = ih.value;
+    if (!S.desde || !S.hasta) { aviso("Elige fecha desde y hasta"); return; }
+    if (S.desde > S.hasta) { const x = S.desde; S.desde = S.hasta; S.hasta = x; }
+    S.periodo = "custom";
+    LS.set("periodoPref", "custom");
+    S.ventas.pagina = S.prod.pagina = S.exis.pagina = S.cajaPag = S.ev.pagina = 1;
+    marcarNav();
     vista();
   },
   buscarGlobal: () => {
@@ -1741,6 +1890,16 @@ const ENT = {
   origenTr: (el) => { S.exis.origen = el.value; },
   destinoTr: (el) => { S.exis.destino = el.value; },
   tipoEv: (el) => { S.ev.tipo = el.value; S.ev.pagina = 1; vista(true); },
+  fechaDesde: (el) => {
+    S.desde = el.value;
+    S.periodo = "custom";
+    if (!S.hasta) S.hasta = S.desde;
+  },
+  fechaHasta: (el) => {
+    S.hasta = el.value;
+    S.periodo = "custom";
+    if (!S.desde) S.desde = S.hasta;
+  },
   rolUsuario: async (el) => { try { await post("/api/ajustes/rol", { id: el.dataset.id, rol: el.value }); aviso("Rol cambiado"); } catch (err) { aviso(err.message); vista(true); } },
 };
 const manejarEntrada = (ev) => {

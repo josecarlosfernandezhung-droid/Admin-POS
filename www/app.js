@@ -13,7 +13,7 @@ const SS = {
 };
 const S = { base: "", token: "", yo: null, periodo: LS.get("periodoPref") || "hoy", desde: "", hasta: "", vista: "resumen", estado: null, conteos: {}, tk: 0,
   ventas: { q: "", pagina: 1, sub: "tickets" }, prod: { q: "", familia: "", orden: "vendidos", activos: true, pagina: 1, sub: "lista" }, exis: { q: "", local: "", pagina: 1 },
-  cajaPag: 1, invSub: "alertas", abcClase: "A", perSub: "auditoria", ev: { tipo: "cancel", usuario: "", nombre: "", pagina: 1 }, pagCb: null,
+  cajaPag: 1, filtroUsuario: "", filtroLocal: "", usuariosFiltro: [], localesFiltro: [], invSub: "alertas", abcClase: "A", perSub: "informe", ev: { tipo: "cancel", usuario: "", nombre: "", pagina: 1 }, pagCb: null,
   favs: (() => { try { return JSON.parse(LS.get("favs") || "[]"); } catch { return []; } })(),
 };
 function aplicarPrefs() {
@@ -34,9 +34,40 @@ function paramsPeriodo(extra = {}) {
     p.desde = S.desde;
     p.hasta = S.hasta;
   }
+  if (S.filtroUsuario) p.usuario = S.filtroUsuario;
+  if (S.filtroLocal) p.local = S.filtroLocal;
   return p;
 }
 
+async function cargarFiltrosGlobales() {
+  try {
+    const d = await get("/api/equipo", paramsPeriodo({}));
+    S.usuariosFiltro = (d.cajeros || []).map((x) => ({ id: x.id, nombre: x.nombre }));
+  } catch { S.usuariosFiltro = []; }
+  try {
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "existencias", pagina: 1 }));
+    // locales may not be here — try ipv
+  } catch {}
+  try {
+    const d = await get("/api/ipv", paramsPeriodo({}));
+    S.localesFiltro = (d.locales || []).map((x) => ({ id: x.id, nombre: x.nombre }));
+  } catch { S.localesFiltro = []; }
+  const box = document.getElementById("filtros-globales");
+  if (box) box.innerHTML = htmlFiltrosGlobales();
+}
+function htmlFiltrosGlobales() {
+  if (S.yo && S.yo.rol === "cajero") return "";
+  const u = S.usuariosFiltro || [];
+  const l = S.localesFiltro || [];
+  return `<select data-in="filtroUsuario" title="Cajero" style="max-width:42%">
+      <option value="">Todos los cajeros</option>
+      ${u.map((x) => `<option value="${x.id}" ${String(S.filtroUsuario) === String(x.id) ? "selected" : ""}>${e(x.nombre)}</option>`).join("")}
+    </select>
+    <select data-in="filtroLocal" title="Local" style="max-width:42%">
+      <option value="">Todos los locales</option>
+      ${l.map((x) => `<option value="${x.id}" ${String(S.filtroLocal) === String(x.id) ? "selected" : ""}>${e(x.nombre)}</option>`).join("")}
+    </select>`;
+}
 // ---------- Formato ----------
 const e = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n, d = 2) => Number(n || 0).toLocaleString("es-ES", { maximumFractionDigits: d });
@@ -52,18 +83,72 @@ const ROL = { admin: "Administrador", gerente: "Gerente", cajero: "Cajero" };
 const etRol = (r) => `<span class="etiqueta et-${r}">${ROL[r] || r}</span>`;
 
 // ---------- Comunicación con el servidor ----------
+function bannerOffline(mostrar, texto) {
+  let b = document.getElementById("banner-offline");
+  if (!mostrar) {
+    if (b) b.hidden = true;
+    return;
+  }
+  if (!b) {
+    b = document.createElement("div");
+    b.id = "banner-offline";
+    b.className = "banner-offline";
+    document.body.appendChild(b);
+  }
+  b.hidden = false;
+  b.textContent = texto || "Sin conexión a MariaDB / PC. Mostrando última carga en caché.";
+}
 async function api(ruta, op = {}) {
   const cab = { "Content-Type": "application/json" };
   if (S.token) cab.Authorization = "Bearer " + S.token;
+  const method = (op.method || "GET").toUpperCase();
+  const cacheable = method === "GET" && ruta.startsWith("/api/") && !ruta.includes("diagnostico");
   let r;
-  try { r = await fetch(S.base + ruta, { ...op, headers: cab }); }
-  catch { throw new Error("No se pudo conectar con la PC. Revisa que esté encendida y en la misma red WiFi."); }
+  try {
+    r = await fetch(S.base + ruta, { ...op, headers: cab });
+  } catch (err) {
+    if (cacheable) {
+      const hit = CACHE.get(ruta, null);
+      if (hit && hit.data) {
+        bannerOffline(true, "Sin conexión con la PC. Mostrando datos de " + new Date(hit.t).toLocaleString() + " (caché).");
+        return { ...hit.data, _cache: true, _cacheTs: hit.t };
+      }
+    }
+    bannerOffline(true, "No se pudo conectar con la PC. Revisa WiFi y que Admin POS esté activo.");
+    throw new Error("No se pudo conectar con la PC. Revisa que esté encendida y en la misma red WiFi.");
+  }
   const d = await r.json().catch(() => ({}));
   if (r.status === 401 && S.token) { sesionVencida(); throw new Error(d.error || "Sesión vencida"); }
-  if (!r.ok) throw Object.assign(new Error(d.error || "Error " + r.status), { status: r.status });
+  if (!r.ok) {
+    // BD caída suele venir como 503
+    if ((r.status === 503 || r.status >= 500) && cacheable) {
+      const hit = CACHE.get(ruta, null);
+      if (hit && hit.data) {
+        bannerOffline(true, "MariaDB no responde. Mostrando última carga (" + new Date(hit.t).toLocaleString() + ").");
+        return { ...hit.data, _cache: true, _cacheTs: hit.t };
+      }
+    }
+    throw Object.assign(new Error(d.error || "Error " + r.status), { status: r.status });
+  }
+  bannerOffline(false);
+  if (cacheable && d && typeof d === "object") CACHE.set(ruta, null, d);
   return d;
 }
-const get = (ruta, p) => api(ruta + (p ? "?" + new URLSearchParams(p) : ""));
+const get = (ruta, p) => {
+  const qs = p ? "?" + new URLSearchParams(p) : "";
+  const full = ruta + qs;
+  return api(full).then((d) => {
+    if (d && !d._cache) CACHE.set(full, null, d);
+    return d;
+  }).catch(async (err) => {
+    const hit = CACHE.get(full, null);
+    if (hit && hit.data) {
+      bannerOffline(true, "Sin datos en vivo. Caché de " + new Date(hit.t).toLocaleString() + ".");
+      return { ...hit.data, _cache: true, _cacheTs: hit.t };
+    }
+    throw err;
+  });
+};
 const post = (ruta, c) => api(ruta, { method: "POST", body: JSON.stringify(c || {}) });
 
 let venciendo = false;
@@ -321,14 +406,30 @@ function pantallaLicencia(lic = {}) {
 }
 
 // ---------- Estructura principal ----------
-const SECCIONES = [["resumen", "Resumen"], ["ventas", "Ventas"], ["productos", "Productos"], ["existencias", "Existencias"], ["caja", "Caja"], ["equipo", "Equipo"], ["inventario", "Inventario"], ["perdidas", "Pérdidas"], ["ajustes", "Ajustes"], ["ayuda", "Ayuda"]];
+const SECCIONES = [
+  ["resumen", "Inicio"],
+  ["ventas", "Ventas"],
+  ["caja", "Caja"],
+  ["inventario", "Stock"],
+  ["equipo", "Equipo"],
+  ["perdidas", "Control"],
+  ["ajustes", "Ajustes"],
+  ["ayuda", "Ayuda"],
+];
+function puedeSeccion(k) {
+  const p = (S.yo && S.yo.permisos) || [];
+  if (p.includes(k)) return true;
+  if (k === "inventario" && p.includes("existencias")) return true;
+  if (k === "ventas" && p.includes("productos")) return true;
+  return false;
+}
 const SIN_PERIODO = ["inventario", "ajustes", "ayuda"];
 let temporizadores = [];
 
 function entrarApp() {
   SS.set("token", S.token);
   cerrarModal();
-  const items = SECCIONES.filter(([k]) => S.yo.permisos.includes(k));
+  const items = SECCIONES.filter(([k]) => puedeSeccion(k));
   if (!items.some(([k]) => k === S.vista)) S.vista = "resumen";
   const pip = (k) => (k === "inventario" || k === "perdidas" ? `<span class="pip" data-pip="${k}" hidden></span>` : "");
   $("#raiz").innerHTML = `<div class="app">
@@ -337,23 +438,25 @@ function entrarApp() {
       <div class="pie"><div>${e(S.yo.nombre)} · ${ROL[S.yo.rol]}</div><button data-act="cambiarMiPin">Cambiar mi PIN</button><button data-act="salir">Salir</button></div></aside>
     <div class="principal"><div class="barra">
       <div class="marca"><img src="logo.png" alt=""><h2>Admin POS</h2><button class="yo" data-act="menuYo">${e(S.yo.nombre)}</button></div>
-      <div class="periodo" id="periodo">${[["hoy", "Hoy"], ["7", "7 días"], ["30", "30 días"], ["90", "90 días"], ["todo", "Todo"], ["custom", "Fechas"]].map(([v, n]) => `<button data-act="periodo" data-v="${v}">${n}</button>`).join("")}
-        <button class="btn sec chico" data-act="buscarGlobal" title="Buscar">🔍</button>
-        <button class="btn sec chico" data-act="toggleTema" id="btnTema" title="Cambiar tema claro/oscuro">${LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro"}</button>
-        <button class="btn sec chico" data-act="prefsUI" title="Preferencias">Aa</button>
+      <div class="barra-fechas">
+        <div class="periodo" id="periodo">${[["hoy", "Hoy"], ["7", "7 días"], ["30", "30 días"], ["90", "90 días"], ["todo", "Todo"], ["custom", "Fechas"]].map(([v, n]) => `<button data-act="periodo" data-v="${v}">${n}</button>`).join("")}</div>
         <span id="rango-custom" class="rango-custom" ${S.periodo === "custom" ? "" : "hidden"}>
           <input type="date" id="desde" value="${e(S.desde)}" data-in="fechaDesde" title="Desde">
           <span class="muted">–</span>
           <input type="date" id="hasta" value="${e(S.hasta)}" data-in="fechaHasta" title="Hasta">
           <button type="button" class="btn sec chico" data-act="aplicarFechas" title="Aplicar rango">Aplicar</button>
         </span>
-          <input type="date" id="hasta" value="${e(S.hasta)}" data-in="fechaHasta">
-          <button class="btn sec" data-act="aplicarFechas" style="padding:6px 10px;font-size:.82rem">Ver</button>
-        </span>
       </div>
-      <div class="menu" id="menu">${items.map(([k, n]) => `<button data-act="ir" data-v="${k}">${n}${pip(k)}</button>`).join("")}</div></div>
+      <div class="barra-tools">
+        <button class="btn sec chico" data-act="buscarGlobal" title="Buscar">🔍</button>
+        <button class="btn sec chico" data-act="toggleTema" id="btnTema" title="Cambiar tema claro/oscuro">${LS.get("tema") === "oscuro" ? "☀️ Claro" : "🌙 Oscuro"}</button>
+        <button class="btn sec chico" data-act="prefsUI" title="Preferencias">Aa</button>
+      </div>
+      <div class="menu" id="menu">${items.map(([k, n]) => `<button data-act="ir" data-v="${k}">${n}${pip(k)}</button>`).join("")}</div>
+    </div>
       <main class="contenido" id="contenido"></main></div></div>`;
   marcarNav();
+  cargarFiltrosGlobales();
   vista();
   actualizarConteos();
   temporizadores.forEach(clearInterval);
@@ -368,7 +471,11 @@ function marcarNav() {
   const mb = document.querySelector("#menu .sel"); if (mb) mb.scrollIntoView({ inline: "center", block: "nearest" });
 }
 
-function ir(v) { S.vista = v; S.ventas.pagina = S.prod.pagina = S.exis.pagina = S.cajaPag = 1; marcarNav(); window.scrollTo(0, 0); vista(); }
+function ir(v) {
+  if (v === "productos") { v = "ventas"; S.ventas.sub = "catalogo"; }
+  if (v === "existencias") { v = "inventario"; S.invSub = "existencias"; }
+  if (S.invSub === "fisico") S.invSub = "arqueo";
+  S.vista = v; S.ventas.pagina = S.prod.pagina = S.exis.pagina = S.cajaPag = 1; marcarNav(); window.scrollTo(0, 0); vista(); }
 
 async function vista(silencio) {
   const tk = ++S.tk;
@@ -513,12 +620,10 @@ const vistas = {};
 
 vistas.resumen = async (silencio) => {
   const tk = S.tk;
-  const [d, panel, alertas] = await Promise.all([
-    get("/api/resumen", paramsPeriodo()),
-    get("/api/panel", paramsPeriodo()).catch(() => null),
-    get("/api/alertas-inicio", paramsPeriodo()).catch(() => null),
-  ]);
+  const d = await get("/api/resumen", paramsPeriodo());
   if (!aqui(tk)) return;
+  const panel = d.panel || null;
+  const alertas = d.alertasInicio || null;
   const solo = S.yo.rol === "cajero";
   const pico = d.porHora.reduce((m, x) => (!m || x.total > m.total ? x : m), null);
   const tr = d.tiempoReal;
@@ -650,11 +755,63 @@ vistas.resumen = async (silencio) => {
   requestAnimationFrame(() => montarCharts(d));
 };
 
+
+async function renderProductosDentroVentas(tabs) {
+  const tk = S.tk;
+  if (S.prod.sub === "margen") {
+    const d = await get("/api/productos-modo", paramsPeriodo({ modo: "margen" }));
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Ventas", "Catálogo y análisis de productos.")}${tabs}
+      <div class="tarjeta"><h3>Margen por familia</h3><div class="scroll"><table><tr><th>Familia</th><th class="d">Ventas</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">Margen</th></tr>
+      ${(d.familias||[]).map((f) => `<tr><td>${e(f.familia)}</td><td class="d num">${cup(f.ventas)}</td><td class="d num">${cup(f.costo)}</td><td class="d num">${cup(f.ganancia)}</td><td class="d num">${fmt(f.margen * 100, 1)} %</td></tr>`).join("")}
+      </table></div></div>
+      <div class="tarjeta"><h3>Por producto</h3><div class="scroll"><table><tr><th>Producto</th><th class="d">Unid.</th><th class="d">Ventas</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">Margen</th></tr>
+      ${(d.filas||[]).map((x) => `<tr><td>${e(x.nombre)}</td><td class="d num">${fmt(x.unidades, 0)}</td><td class="d num">${cup(x.ventas)}</td><td class="d num">${cup(x.costo)}</td><td class="d num">${cup(x.ganancia)}</td><td class="d num">${fmt(x.margen * 100, 1)} %</td></tr>`).join("")}
+      </table></div></div>`;
+    return;
+  }
+  if (S.prod.sub === "top") {
+    const d = await get("/api/productos-modo", paramsPeriodo({ modo: "top", limite: 50 }));
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Ventas", "Productos más vendidos.")}${tabs}
+      <div class="tarjeta"><div class="scroll"><table><tr><th>Producto</th><th class="d">Unid.</th><th class="d">Importe</th></tr>
+      ${(d.filas||d.top||[]).map((x) => `<tr><td>${e(x.nombre)}</td><td class="d num">${fmt(x.unidades,1)}</td><td class="d num">${cup(x.total||x.importe)}</td></tr>`).join("")}
+      </table></div></div>`;
+    return;
+  }
+  if (S.prod.sub === "precios") {
+    const d = await get("/api/cambios-precio", paramsPeriodo());
+    if (!aqui(tk)) return;
+    $("#contenido").innerHTML = `${cab("Ventas", "Cambios de precio en ventas.")}${tabs}
+      <div class="tarjeta"><div class="scroll"><table><tr><th>Producto</th><th>Detalle</th></tr>
+      ${(d.filas||[]).map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(String(x.precios||x.detalle||x.mensaje||""))}</td></tr>`).join("")||'<tr><td colspan="2" class="muted">Sin cambios</td></tr>'}
+      </table></div></div>`;
+    return;
+  }
+  const d = await get("/api/productos-modo", paramsPeriodo({ modo: "lista", q: S.prod.q, familia: S.prod.familia, orden: S.prod.orden, activos: S.prod.activos ? 1 : 0, pagina: S.prod.pagina }));
+  if (!aqui(tk)) return;
+  $("#contenido").innerHTML = `${cab("Ventas", "Catálogo de productos.")}${tabs}
+    <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Nombre o código" value="${e(S.prod.q)}" data-in="buscaProd">
+    <select data-in="ordenProd">${[["vendidos","Más vendidos"],["nombre","Nombre"],["stock","Stock"],["precio","Precio"]].map(([v,n])=>`<option value="${v}" ${S.prod.orden===v?"selected":""}>${n}</option>`).join("")}</select>
+    </div><div id="lista"></div></div>`;
+  S.pagCb = (n) => { S.prod.pagina = n; vistas.ventas(); };
+  $("#lista").innerHTML = `<div class="scroll"><table><tr><th>Producto</th><th class="d">Stock</th><th class="d">Precio</th><th class="d">Vendido</th></tr>
+    ${(d.filas||[]).map((x)=>`<tr class="clic" data-act="prodTx" data-id="${x.id}" style="cursor:pointer"><td>${e(x.nombre)}<small>${e(x.codigo||"")}</small></td><td class="d num">${fmt(x.stock,1)}</td><td class="d num">${cup(x.precio)}</td><td class="d num">${cup(x.vendido||x.importe||0)}</td></tr>`).join("")}
+    </table></div>${pager(d.pagina, d.paginas)}`;
+}
+
 vistas.ventas = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["tickets", "Tickets"], ["dia", "Ventas por día"]], S.ventas.sub, "ventasSub");
+  const tabs = subTabs([["tickets", "Tickets"], ["dia", "Por día"], ["catalogo", "Catálogo"], ["top", "Top"], ["margen", "Margen"], ["precios", "Precios"]], S.ventas.sub, "ventasSub");
+  if (["catalogo", "top", "margen", "precios"].includes(S.ventas.sub)) {
+    const prev = S.prod.sub;
+    S.prod.sub = S.ventas.sub === "catalogo" ? "lista" : S.ventas.sub;
+    await renderProductosDentroVentas(tabs);
+    S.prod.sub = prev;
+    return;
+  }
   if (S.ventas.sub === "dia") {
-    const d = await get("/api/ventas-dia", paramsPeriodo());
+    const d = await get("/api/ventas-modo", paramsPeriodo({ modo: "dia" }));
     if (!aqui(tk)) return;
     const r = d.resumen;
     $("#contenido").innerHTML = `${cab("Ventas", "Total de transacciones y desglose diario.")}${tabs}
@@ -686,142 +843,81 @@ async function listaVentas() {
 async function abrirTicket(acct) {
   try {
     const t = await get("/api/ticket", { acct });
+    const estado = t.estado || (t.anulado ? "Anulada" : t.devolucion ? "Devolución" : "Venta");
     const logsHtml = (t.logs && t.logs.length)
-      ? `<div style="margin-top:14px"><h4 style="margin:0 0 6px;font-size:.9rem">Registro relacionado (anulaciones, cancelaciones…)</h4>
-          ${t.logs.map((l) => `<div class="fila" style="align-items:flex-start"><div><small>${fechaHora(l.fecha)} · ${e(l.usuario)}</small><div style="font-size:.88rem">${e(l.mensaje)}</div></div></div>`).join("")}</div>`
-      : "";
+      ? `<div style="margin-top:14px"><h4 style="margin:0 0 6px;font-size:.9rem">Log Axis (anulaciones, cancelaciones, cambios…)</h4>
+          ${t.logs.map((l) => `<div class="fila" style="align-items:flex-start"><div><small>${e(l.fecha)} · ${e(l.usuario)}</small><div style="font-size:.88rem">${e(l.mensaje)}</div></div></div>`).join("")}</div>`
+      : `<p class="muted" style="margin-top:12px;font-size:.84rem">Sin mensajes de log ligados a este ticket.</p>`;
     const pagosHtml = (t.pagos && t.pagos.length)
       ? `<div style="margin-top:10px"><h4 style="margin:0 0 6px;font-size:.9rem">Pagos registrados</h4>
           ${t.pagos.map((p) => `<div class="fila"><div>Modo ${e(p.modo)}${p.socio ? ` · ${e(p.socio)}` : ""}</div><div class="d num">${cup(p.monto)}</div></div>`).join("")}</div>`
       : "";
-    abrirModal(`<div class="panel"><header><div><span class="muted">${t.devolucion ? "Devolución" : "Ticket"}</span><h2 class="num">${t.ticket}</h2><span class="muted">${fechaHora(t.fecha)} · ${e(t.cajero || "")} · ${e(t.socio || "")}</span></div><button class="cerrar" data-act="cerrarModal">✕</button></header>
-      <div class="cuerpo">${t.lineas.map((l) => `<div class="fila"><div>${e(l.nombre)}<small>${fmt(l.cant, 3)} pzs. × ${cup(l.precio)}${l.descuento ? ` · desc. ${fmt(l.descuento, 1)} %` : ""}${l.nota ? ` · ${e(l.nota)}` : ""}</small></div><div class="d num">${cup(l.importe)}</div></div>`).join("")}
-      ${pagosHtml}${logsHtml}</div>
+    const lineasHtml = (t.lineas && t.lineas.length)
+      ? t.lineas.map((l) => `<div class="fila"><div>${e(l.nombre)}
+          <small>${fmt(l.cant, 3)} pzs. × ${cup(l.precio)}${l.descuento ? ` · desc. ${fmt(l.descuento, 1)} %` : ""}
+          ${l.tipo != null ? ` · tipo ${l.tipo}` : ""}${l.sign != null ? ` · sign ${l.sign}` : ""}${l.nota ? ` · ${e(l.nota)}` : ""}</small></div>
+          <div class="d num">${cup(l.importe)}</div></div>`).join("")
+      : `<p class="muted">Sin líneas de operación (puede estar solo en el log de anulación).</p>`;
+    abrirModal(`<div class="panel"><header><div>
+        <span class="muted">${e(estado)}</span>
+        <h2 class="num">${t.ticket}</h2>
+        <span class="muted">${fechaHora(t.fecha)} · ${e(t.cajero || "")} · ${e(t.socio || "")}</span>
+        ${t.anulado ? '<span class="etiqueta et-alta" style="margin-top:6px;display:inline-block">Anulada / no finalizada</span>' : ""}
+      </div><button class="cerrar" data-act="cerrarModal">✕</button></header>
+      <div class="cuerpo">${lineasHtml}${pagosHtml}${logsHtml}</div>
       <footer><span class="muted">Total</span><b class="num">${cup(t.total)}</b></footer></div>`, "");
   } catch (err) { aviso(err.message); }
 }
 
 vistas.productos = async () => {
-  const tk = S.tk;
-  const tabs = subTabs([["lista", "Catálogo"], ["top", "Top"], ["precios", "Precios"], ["margen", "Margen"], ["efecto", "Efecto precio"]], S.prod.sub, "prodSub");
-  if (S.prod.sub === "margen") {
-    const d = await get("/api/margen", paramsPeriodo());
-    if (!aqui(tk)) return;
-    $("#contenido").innerHTML = `${cab("Productos", "Margen bruto por producto y familia (costo real o estimado).")}${tabs}
-      <div class="tarjeta"><h3>Por familia</h3><div class="scroll"><table><tr><th>Familia</th><th class="d">Ventas</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">Margen</th></tr>
-      ${d.familias.map((f) => `<tr><td>${e(f.familia)}</td><td class="d num">${cup(f.ventas)}</td><td class="d num">${cup(f.costo)}</td><td class="d num">${cup(f.ganancia)}</td><td class="d num">${fmt(f.margen * 100, 1)} %</td></tr>`).join("")}
-      </table></div></div>
-      <div class="tarjeta"><h3>Por producto</h3><div class="scroll"><table><tr><th>Producto</th><th class="d">Unid.</th><th class="d">Ventas</th><th class="d">Costo</th><th class="d">Ganancia</th><th class="d">Margen</th></tr>
-      ${d.filas.map((x) => `<tr><td>${e(x.nombre)}${x.estimado ? " <small>(est.)</small>" : ""}</td><td class="d num">${fmt(x.unidades, 0)}</td><td class="d num">${cup(x.ventas)}</td><td class="d num">${cup(x.costo)}</td><td class="d num">${cup(x.ganancia)}</td><td class="d num">${fmt(x.margen * 100, 1)} %</td></tr>`).join("")}
-      </table></div></div>`;
-    return;
-  }
-  if (S.prod.sub === "efecto") {
-    const d = await get("/api/efecto-precios", paramsPeriodo());
-    if (!aqui(tk)) return;
-    $("#contenido").innerHTML = `${cab("Productos", "Productos cuyo precio medio cambió entre la 1.ª y 2.ª mitad del período.")}${tabs}
-      <div class="tarjeta"><div class="scroll"><table><tr><th>Producto</th><th class="d">P. antes</th><th class="d">P. después</th><th class="d">Δ %</th><th class="d">Unid. antes</th><th class="d">Unid. después</th><th class="d">Δ unid.</th></tr>
-      ${d.filas.map((x) => `<tr><td>${e(x.nombre)}</td><td class="d num">${cup(x.precioAntes)}</td><td class="d num">${cup(x.precioDespues)}</td>
-        <td class="d num">${fmt(x.cambioPct * 100, 1)} %</td><td class="d num">${fmt(x.unidAntes, 0)}</td><td class="d num">${fmt(x.unidDespues, 0)}</td>
-        <td class="d num">${x.varUnid != null ? fmt(x.varUnid * 100, 0) + " %" : "—"}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">Sin cambios de precio significativos</td></tr>'}
-      </table></div></div>`;
-    return;
-  }
-  if (S.prod.sub === "top") {
-    const d = await get("/api/top", paramsPeriodo({ limite: 50 }));
-    if (!aqui(tk)) return;
-    $("#contenido").innerHTML = `${cab("Productos", "Los más vendidos del período. Toca uno para ver sus transacciones.")}${tabs}
-      <div class="kpis"><div class="kpi"><span>Importe de estos productos</span><b class="num">${cup(d.totalImporte)}</b></div></div>
-      <div class="tarjeta"><div class="scroll"><table><tr><th>#</th><th>Artículo</th><th>Familia</th><th class="d">Unid.</th><th class="d">Tickets</th><th class="d">%</th><th class="d">Total</th></tr>
-      ${d.filas.map((p) => `<tr class="clic" data-act="prodTx" data-id="${p.id}" style="cursor:pointer"><td class="num muted">${p.puesto}</td><td>${e(p.nombre)}<small>${e(p.codigo || "")}</small></td><td class="muted">${e(p.familia)}</td><td class="d num">${fmt(p.unidades, 0)}</td><td class="d num">${fmt(p.tickets, 0)}</td><td class="d num">${fmt(p.parte * 100, 1)} %</td><td class="d num"><b>${cup(p.total)}</b></td></tr>`).join("") || '<tr><td colspan="7" class="muted">Sin ventas</td></tr>'}
-      </table></div></div>`;
-    return;
-  }
-  if (S.prod.sub === "precios") {
-    const d = await get("/api/cambios-precio", paramsPeriodo());
-    if (!aqui(tk)) return;
-    $("#contenido").innerHTML = `${cab("Productos", "Artículos vendidos a más de un precio en el período y quién los cobró así.")}${tabs}
-      <div class="kpis"><div class="kpi"><span>Productos con varios precios</span><b class="num">${fmt(d.total, 0)}</b></div></div>
-      <div class="tarjeta"><p class="muted" style="margin:0 0 10px;font-size:.86rem">Se detecta por el precio de cada línea de venta en AxisPOS (no hay un log de «quién editó la ficha»). Si el mismo producto se vendió a 2+ precios distintos, aquí ves a qué precio, cuántas veces y qué cajero lo cobró.</p>
-      ${d.filas.map((p) => `<div class="tarjeta" style="margin:0 0 12px;box-shadow:none;border:1px solid var(--borde)">
-        <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
-          <div><b>${e(p.nombre)}</b><small style="display:block">${e(p.familia)}${p.codigo ? " · " + e(p.codigo) : ""}</small></div>
-          <div class="d num"><span class="etiqueta et-media">${p.nPrecios} precios</span>
-            <small style="display:block">de ${cup(p.precioMin)} a ${cup(p.precioMax)} (Δ ${cup(p.variacion)})</small></div>
-        </div>
-        <div class="scroll" style="margin-top:8px"><table><tr><th class="d">Precio</th><th class="d">Unid.</th><th class="d">Tickets</th><th>Quién cobró a ese precio</th></tr>
-        ${p.precios.map((pr) => `<tr>
-          <td class="d num"><b>${cup(pr.precio)}</b></td>
-          <td class="d num">${fmt(pr.unidades, 0)}</td>
-          <td class="d num">${fmt(pr.tickets, 0)}</td>
-          <td>${(pr.quienes || []).map((q) => `${e(q.usuario)} (${fmt(q.tickets, 0)} t.)`).join(", ") || "—"}</td>
-        </tr>`).join("")}
-        </table></div>
-      </div>`).join("") || '<p class="muted">En este período ningún producto se vendió a más de un precio distinto.</p>'}
-      </div>`;
-    return;
-  }
-  const d0 = await get("/api/productos", paramsPeriodo({ q: S.prod.q, familia: S.prod.familia, orden: S.prod.orden, activos: S.prod.activos ? 1 : 0, pagina: S.prod.pagina }));
-  if (!aqui(tk)) return;
-  S.famLista = d0.familias;
-  $("#contenido").innerHTML = `${cab("Productos", "Catálogo y ventas. Toca un artículo para ver sus transacciones.")}${tabs}
-    <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Nombre o código" value="${e(S.prod.q)}" data-in="buscaProd">
-    <select data-in="famProd"><option value="">Todas las familias</option>${d0.familias.map((f) => `<option value="${f.id}" ${String(f.id) === String(S.prod.familia) ? "selected" : ""}>${e(f.nombre)}</option>`).join("")}</select>
-    <select data-in="ordenProd">${[["vendidos", "Más vendidos"], ["nombre", "Nombre"], ["stock", "Más existencia"], ["precio", "Mayor precio"]].map(([v, n]) => `<option value="${v}" ${S.prod.orden === v ? "selected" : ""}>${n}</option>`).join("")}</select>
-    <label class="chk"><input type="checkbox" data-in="activosProd" ${S.prod.activos ? "checked" : ""}> Solo activos</label></div><div id="lista"></div></div>`;
-  S.pagCb = (n) => { S.prod.pagina = n; recargarProd(); };
-  pintarProd(d0);
+  const map = { lista: "catalogo", top: "top", margen: "margen", precios: "precios", efecto: "precios" };
+  S.ventas.sub = map[S.prod.sub] || "catalogo";
+  S.vista = "ventas";
+  marcarNav();
+  return vistas.ventas();
 };
-async function recargarProd() {
-  const tk = S.tk;
-  const d = await get("/api/productos", paramsPeriodo({ q: S.prod.q, familia: S.prod.familia, orden: S.prod.orden, activos: S.prod.activos ? 1 : 0, pagina: S.prod.pagina }));
-  if (aqui(tk)) pintarProd(d);
-}
-function pintarProd(d) {
-  const cajero = S.yo.rol === "cajero";
-  $("#lista").innerHTML = `<p class="muted" style="margin:0 0 8px">${fmt(d.total, 0)} artículos. Toca una fila para ver transacciones del período.</p><div class="scroll"><table><tr><th>Código</th><th>Artículo</th><th>Familia</th><th class="d">Precio</th><th class="d">Existencia</th>${cajero ? "" : '<th class="d">Vendido</th>'}</tr>
-    ${d.filas.map((p) => `<tr class="clic" data-act="prodTx" data-id="${p.id}" style="cursor:pointer"><td class="muted">${e(p.codigo)}</td><td>${e(p.nombre)}</td><td class="muted">${e(p.familia)}</td><td class="d num">${cup(p.precio)}</td><td class="d num ${p.existencia <= 0 ? "baja" : ""}" ${p.existencia <= 0 ? 'style="color:var(--rojo)"' : ""}>${fmt(p.existencia, 2)}</td>${cajero ? "" : `<td class="d num">${p.vendido ? fmt(p.vendido, 0) + " · " + compacto(p.importe) : "—"}</td>`}</tr>`).join("") || '<tr><td colspan="6" class="muted">No se encontró nada</td></tr>'}</table></div>${pager(d.pagina, d.paginas)}`;
-}
-async function abrirProdTx(id, pagina = 1) {
-  try {
-    const d = await get("/api/prod-tx", paramsPeriodo({ id, pagina }));
-    if (d.error) { aviso(d.error); return; }
-    const p = d.producto;
-    abrirModal(`<div class="panel"><header><div><span class="muted">Transacciones del producto</span><h2>${e(p.nombre)}</h2>
-      <span class="muted">${e(p.codigo || "")} · ${e(p.familia || "")} · ${fmt(d.tickets, 0)} tickets · ${fmt(d.unidades, 0)} u. · ${cup(d.importe)}</span></div>
-      <button class="cerrar" data-act="cerrarModal">✕</button></header>
-      <div class="cuerpo"><div class="scroll"><table><tr><th>Cuándo</th><th>Ticket</th><th>Cajero</th><th class="d">Cant.</th><th class="d">Importe</th></tr>
-      ${d.filas.map((x) => `<tr class="clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer"><td class="num">${fechaHora(x.fecha)}</td><td class="link num">${x.ticket}</td><td>${e(x.cajero)}</td><td class="d num">${fmt(x.cant, 2)}</td><td class="d num">${cup(x.importe)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Sin ventas en el período</td></tr>'}
-      </table></div>
-      ${d.paginas > 1 ? `<div style="margin-top:10px;display:flex;gap:8px;justify-content:center">${d.pagina > 1 ? `<button class="btn sec" data-act="prodTxPag" data-id="${p.id}" data-n="${d.pagina - 1}">Anterior</button>` : ""}${d.pagina < d.paginas ? `<button class="btn sec" data-act="prodTxPag" data-id="${p.id}" data-n="${d.pagina + 1}">Siguiente</button>` : ""}</div>` : ""}
-      </div></div>`, "");
-  } catch (err) { aviso(err.message); }
-}
 
 vistas.existencias = async () => {
-  const tk = S.tk;
-  const d = await get("/api/existencias", paramsPeriodo({ q: S.exis.q, local: S.exis.local, pagina: S.exis.pagina }));
-  if (!aqui(tk)) return;
-  $("#contenido").innerHTML = `${cab("Existencias", "Foto del almacén según AxisPOS. Las cantidades son las que están guardadas, pieza por pieza.")}
-    <div class="kpis"><div class="kpi"><span>Referencias con stock</span><b class="num">${fmt(d.referencias, 0)}</b></div><div class="kpi"><span>Piezas en total</span><b class="num">${fmt(d.piezas, 0)}</b></div><div class="kpi"><span>Vendidos y agotados</span><b class="num">${fmt(d.agotados, 0)}</b></div></div>
-    ${d.agotadosLista.length ? `<div class="tarjeta"><h3>Se vendieron y ya no quedan <small>en el período</small></h3><div class="rejilla2">${d.agotadosLista.map((x) => `<div class="fila"><div>${e(x.nombre)}</div><div class="d num muted">${cup(x.importe)}</div></div>`).join("")}</div></div>` : ""}
-    <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Buscar artículo" value="${e(S.exis.q)}" data-in="buscaExis"><select data-in="localExis"><option value="">Todos los locales</option>${d.locales.map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.local) ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}</select></div><div id="lista"></div></div>`;
-  S.pagCb = (n) => { S.exis.pagina = n; recargarExis(); };
-  pintarExis(d);
+  S.invSub = "existencias";
+  S.vista = "inventario";
+  marcarNav();
+  return vistas.inventario();
 };
-async function recargarExis() { const tk = S.tk; const d = await get("/api/existencias", paramsPeriodo({ q: S.exis.q, local: S.exis.local, pagina: S.exis.pagina })); if (aqui(tk)) pintarExis(d); }
-function pintarExis(d) {
-  $("#lista").innerHTML = `<div class="scroll"><table><tr><th>Artículo</th><th>Local</th><th class="d">Cantidad</th></tr>${d.filas.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.local)}</td><td class="d num">${fmt(x.cantidad, 2)}</td></tr>`).join("") || '<tr><td colspan="3" class="muted">Sin existencias para este filtro</td></tr>'}</table></div>${pager(d.pagina, d.paginas)}`;
-}
 
 vistas.caja = async () => {
   const tk = S.tk;
-  const d = await get("/api/caja", paramsPeriodo({ pagina: S.cajaPag }));
+  const d = await get("/api/caja", paramsPeriodo({ pagina: 1, todo: 1 }));
   if (!aqui(tk)) return;
   S.pagCb = (n) => { S.cajaPag = n; vista(true); };
+  const filtro = S.cajaFiltro || "todos";
+  const todas = d.filas || [];
+  const nSin = todas.filter((x) => x.sinContar).length;
+  const nCon = todas.filter((x) => !x.sinContar && x.diferencia != null).length;
+  const nFuera = todas.filter((x) => !x.sinContar && x.diferencia != null && Math.abs(x.diferencia) > (d.tolerancia || 0)).length;
+  let filas = todas;
+  if (filtro === "sin_contar") filas = todas.filter((x) => x.sinContar);
+  else if (filtro === "con_conteo") filas = todas.filter((x) => !x.sinContar && x.diferencia != null);
+  else if (filtro === "fuera_tol") filas = todas.filter((x) => !x.sinContar && x.diferencia != null && Math.abs(x.diferencia) > (d.tolerancia || 0));
+  const porPag = 20;
+  const paginas = Math.max(Math.ceil(filas.length / porPag), 1);
+  const pagina = Math.min(Math.max(S.cajaPag || 1, 1), paginas);
+  S.cajaPag = pagina;
+  d.filas = filas.slice((pagina - 1) * porPag, pagina * porPag);
+  d.pagina = pagina;
+  d.paginas = paginas;
+  const chip = (id, label, n) => `<button type="button" class="btn sec chico ${filtro === id ? "sel-filtro" : ""}" data-act="cajaFiltro" data-v="${id}">${label}${n != null ? ` (${n})` : ""}</button>`;
+  const filtrosHtml = `<div class="filtros" style="margin:0 0 12px;flex-wrap:wrap">
+      ${chip("todos", "Todos", todas.length)}
+      ${chip("sin_contar", "Sin contar", nSin)}
+      ${chip("con_conteo", "Con conteo", nCon)}
+      ${chip("fuera_tol", "Fuera tolerancia", nFuera)}
+    </div>`;
   // DiffClose Axis = esperado − contado → >0 faltante, <0 sobrante
   const etDif = (t) => {
-    if (t.sinContar) return '<span class="etiqueta et-media">Sin contar</span>';
+    if (t.sinContar) {
+      const ax = t.diferenciaAxis != null ? t.diferenciaAxis : t.esperado;
+      return `<span class="etiqueta et-media">Sin contar</span><small class="muted">Axis ${fmt(ax||0,0)}</small>`;
+    }
     if (t.diferencia == null) return '<span class="etiqueta et-gris">Sin cierre</span>';
     const v = t.diferencia;
     if (Math.abs(v) <= (d.tolerancia || 0)) return `<span class="etiqueta et-ok">OK ${v > 0 ? "+" : ""}${fmt(v, 0)}</span>`;
@@ -840,7 +936,7 @@ vistas.caja = async () => {
       <p class="muted" style="margin:0;font-size:.86rem">
         <b>Faltante</b>: al cerrar había <i>menos</i> efectivo del que el libro de caja esperaba (DiffClose &gt; 0).<br>
         <b>Sobrante</b>: había <i>más</i> efectivo del esperado (DiffClose &lt; 0).<br>
-        <b>Neto comunal</b>: suma de faltantes menos sobrantes del período; es la pérdida o ganancia de efectivo que “queda en el negocio” entre todos los turnos.<br>
+        <b>Neto comunal</b>: suma de faltantes menos sobrantes del período (solo turnos <b>con conteo</b>; los “sin contar” no suman).<br>
         <b>Esperado</b> = fondo + libro de caja del turno − retiros (igual que AxisPOS). Tolerancia: ${fmt(d.tolerancia, 0)} CUP (Ajustes).
       </p></div>
     ${(d.porCajero && d.porCajero.length) ? `<div class="tarjeta"><h3>Faltantes y sobrantes por cajero</h3>
@@ -864,6 +960,7 @@ vistas.caja = async () => {
       <p class="muted" style="margin:8px 0 0;font-size:.82rem">El neto comunal por cajero ayuda a ver quién aporta más faltante o sobrante al total del negocio.</p>
     </div>` : ""}
     <div class="tarjeta"><h3>Turnos del período</h3>
+      ${filtrosHtml}
       <div class="scroll"><table>
         <tr><th>Apertura</th><th>Quién</th><th class="d">Ventas</th><th class="d">Libro caja</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Resultado</th><th>Estado</th><th class="d">Horas</th></tr>
         ${d.filas.map((t) => `<tr>
@@ -886,7 +983,7 @@ vistas.equipo = async () => {
   if (!S.eqSub) S.eqSub = "ventas";
   const tabs = subTabs([["ventas", "Ventas"], ["prod", "Productividad"], ["ranking", "Ranking + señales"], ["turnos", "Horario turnos"]], S.eqSub, "eqSub");
   if (S.eqSub === "ranking") {
-    const d = await get("/api/ranking", paramsPeriodo());
+    const d = await get("/api/equipo-modo", paramsPeriodo({ modo: "ranking" }));
     if (!aqui(tk)) return;
     $("#contenido").innerHTML = `${cab("Equipo", "Productividad y señales de caja/anulaciones.")}${tabs}
       <div class="tarjeta"><div class="scroll"><table><tr><th>Cajero</th><th class="d">Ventas/h</th><th class="d">Tickets/h</th><th>Señales</th></tr>
@@ -897,7 +994,7 @@ vistas.equipo = async () => {
     return;
   }
   if (S.eqSub === "prod") {
-    const d = await get("/api/productividad", paramsPeriodo());
+    const d = await get("/api/equipo-modo", paramsPeriodo({ modo: "productividad" }));
     if (!aqui(tk)) return;
     $("#contenido").innerHTML = `${cab("Equipo", "Tickets y ventas por hora de turno.")}${tabs}
       <div class="tarjeta"><div class="scroll"><table><tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Horas</th><th class="d">Tickets/h</th><th class="d">Ventas/h</th><th class="d">Unid/ticket</th><th class="d">Ticket medio</th></tr>
@@ -910,7 +1007,7 @@ vistas.equipo = async () => {
     return;
   }
   if (S.eqSub === "turnos") {
-    const d = await get("/api/turnos-horario", paramsPeriodo());
+    const d = await get("/api/equipo-modo", paramsPeriodo({ modo: "turnos" }));
     if (!aqui(tk)) return;
     const h = d.horario || {};
     $("#contenido").innerHTML = `${cab("Equipo", `Horario esperado apertura ${h.aperturaMin}:00–${h.aperturaMax}:00 · máx ${h.horasMax} h (Ajustes).`)}${tabs}
@@ -941,27 +1038,40 @@ vistas.inventario = async () => {
   const tk = S.tk;
   const tabs = subTabs([
     ["alertas", "Alertas"],
+    ["existencias", "Existencias"],
     ["ipv", "IPV"],
-    ["traspasos", "Traspasos"],
-    ["hechos", "Traspasos hechos"],
-    ["antiguedad", "Antigüedad"],
-    ["fisico", "Físico / Arqueo"],
+    ["traspasos", "Sugeridos"],
+    ["hechos", "Histórico"],
     ["abc", "ABC"],
     ["compras", "Compras"],
+    ["antiguedad", "Antigüedad"],
+    ["arqueo", "Arqueo"],
   ], S.invSub, "invSub");
   let cuerpo = "";
   if (S.invSub === "alertas") {
-    const d = await get("/api/alertas");
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "alertas" }));
     cuerpo = `<div class="kpis"><div class="kpi"><span>Agotados que se vendían</span><b class="num">${d.resumen.agotados}</b></div><div class="kpi"><span>Bajo el mínimo</span><b class="num">${d.resumen.minimo}</b></div><div class="kpi"><span>Por reponer</span><b class="num">${d.resumen.reorden}</b></div></div>
       <div class="tarjeta"><h3>Productos en alerta <small>${d.total} en total</small></h3><p class="muted" style="margin:-4px 0 8px;font-size:.84rem">Se calcula con las ventas de los últimos ${d.ventana} días. Punto de reposición = venta diaria × (${d.plazo} días de entrega + ${d.seguridad} de seguridad). Puedes cambiar estos números en Ajustes.</p>
       ${d.filas.map((x) => `<div class="fila"><div>${e(x.nombre)}<small>${e(x.familia)}${x.clase !== "-" ? " · clase " + x.clase : ""}${x.minimo > 0 ? " · mínimo " + fmt(x.minimo, 0) : ""}</small></div>
         <div class="d"><span class="etiqueta et-${x.tipo}">${TIPO_ALERTA[x.tipo]}</span><small>Stock ${fmt(x.stock, 1)} · vende ${fmt(x.diaria, 1)}/día${x.cobertura != null ? ` · alcanza ${fmt(x.cobertura, 1)} d` : ""}</small></div></div>`).join("") || '<p class="muted">No hay productos en alerta. Todo en orden.</p>'}</div>`;
+  } else if (S.invSub === "existencias") {
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "existencias", q: S.exis.q, local: S.exis.local, pagina: S.exis.pagina }));
+    if (!aqui(tk)) return;
+    cuerpo = `<div class="kpis"><div class="kpi"><span>Referencias</span><b class="num">${fmt(d.referencias,0)}</b></div>
+      <div class="kpi"><span>Piezas</span><b class="num">${fmt(d.piezas,0)}</b></div>
+      <div class="kpi"><span>Agotados</span><b class="num">${fmt(d.agotados,0)}</b></div></div>
+      <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Buscar" value="${e(S.exis.q)}" data-in="buscaExis">
+        <select data-in="localExis"><option value="">Todos</option>${(d.locales||[]).map((l)=>`<option value="${l.id}" ${String(l.id)===String(S.exis.local)?"selected":""}>${e(l.nombre)}</option>`).join("")}</select>
+      </div>
+      <div class="scroll"><table><tr><th>Artículo</th><th>Local</th><th class="d">Cantidad</th></tr>
+      ${(d.filas||[]).map((x)=>`<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.local)}</td><td class="d num">${fmt(x.cantidad,2)}</td></tr>`).join("")}
+      </table></div>${pager(d.pagina,d.paginas)}</div>`;
   } else if (S.invSub === "ipv") {
-    const d = await get("/api/ipv", paramsPeriodo({ q: S.exis.q || "", local: S.exis.local || "" }));
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "ipv", q: S.exis.q || "", local: S.exis.local || "" }));
     if (!aqui(tk)) return;
     const r = d.resumen;
     cuerpo = `<div class="kpis">
-        <div class="kpi"><span>Existencia inicial</span><b class="num">${fmt(r.inicio, 0)}</b><small>valor ~ ${cup(r.valorInicio)}</small></div>
+        <div class="kpi"><span>Existencia inicial</span><b class="num" style="${r.inicio < 0 ? "color:var(--rojo)" : ""}">${fmt(r.inicio, 0)}</b><small>valor ~ ${cup(r.valorInicio)}</small></div>
         <div class="kpi"><span>Entradas</span><b class="num">${fmt(r.entradas, 0)}</b></div>
         <div class="kpi"><span>Ventas</span><b class="num">${fmt(r.ventas, 0)}</b><small>${cup(r.importeVentas)}</small></div>
         <div class="kpi"><span>Existencia final</span><b class="num">${fmt(r.final, 0)}</b><small>valor ~ ${cup(r.valorFinal)}</small></div>
@@ -971,6 +1081,7 @@ vistas.inventario = async () => {
         <div class="kpi"><span>Mermas / bajas</span><b class="num">${fmt(r.mermas, 0)}</b></div>
         <div class="kpi"><span>Productos en el IPV</span><b class="num">${fmt(r.productos, 0)}</b></div>
       </div>
+      ${r.inicio < 0 || r.avisoInicioNegativo ? `<div class="tarjeta"><p class="muted" style="margin:0;font-size:.86rem;color:var(--rojo)"><b>Existencia inicial negativa:</b> el stock actual y los movimientos del período no cuadran${r.productosInicioNeg ? ` (${fmt(r.productosInicioNeg,0)} productos)` : ""}. Filtra por local, revisa historial o haz conteo físico. Con local elegido, movimientos usan ObjectID/turno del mismo almacén.</p></div>` : ""}
       <div class="tarjeta"><div class="filtros"><input type="search" placeholder="Buscar producto" value="${e(S.exis.q)}" data-in="buscaExis">
         <select data-in="localExis"><option value="">Todos los locales</option>${d.locales.map((l) => `<option value="${l.id}" ${String(l.id) === String(S.exis.local) ? "selected" : ""}>${e(l.nombre)}</option>`).join("")}</select>
         <button class="btn sec" data-act="invSub" data-v="ipv">Aplicar</button>
@@ -999,7 +1110,7 @@ vistas.inventario = async () => {
         ${d.porLocal.map((x) => `<tr><td>${e(x.local)}</td><td class="d num">${fmt(x.refs, 0)}</td><td class="d num">${fmt(x.piezas, 1)}</td><td class="d num">${cup(x.costo)}</td><td class="d num">${cup(x.venta)}</td></tr>`).join("")}
         </table></div></div>`;
   } else if (S.invSub === "traspasos") {
-    const d = await get("/api/traspasos", paramsPeriodo());
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "traspasos" }));
     if (!aqui(tk)) return;
     const inv = d.inversion || { total: 0, porLocal: [] };
     cuerpo = `<div class="kpis">
@@ -1030,7 +1141,7 @@ vistas.inventario = async () => {
         </tr>`).join("") || '<tr><td colspan="7" class="muted">Nada que mover: el PV cumple mínimo y cobertura, o no hay stock en almacén.</td></tr>'}
         </table></div></div>`;
   } else if (S.invSub === "hechos") {
-    const d = await get("/api/traspasos-hechos", paramsPeriodo({
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "hechos", 
       q: S.exis.q || "",
       origen: S.exis.origen || "",
       destino: S.exis.destino || "",
@@ -1077,7 +1188,7 @@ vistas.inventario = async () => {
         ${d.porProducto.map((x) => `<tr><td>${e(x.nombre)}<small>${e(x.codigo || "")}</small></td><td class="d num">${fmt(x.n, 0)}</td><td class="d num">${fmt(x.cant, 1)}</td><td class="d num">${cup(x.valor)}</td></tr>`).join("")}
         </table></div></div>` : ""}`;
   } else if (S.invSub === "antiguedad") {
-    const d = await get("/api/antiguedad", paramsPeriodo());
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "antiguedad" }));
     const r = d.resumen;
     cuerpo = `<div class="kpis">
         <div class="kpi"><span>0–30 días</span><b class="num">${fmt(r.d0_30.n, 0)}</b><small>${cup(r.d0_30.capital)}</small></div>
@@ -1094,23 +1205,18 @@ vistas.inventario = async () => {
         <div class="scroll"><table><tr><th>Producto</th><th>Familia</th><th class="d">Stock</th><th class="d">Valor</th></tr>
         ${d.filasNunca.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.familia)}</td><td class="d num">${fmt(x.stock, 1)}</td><td class="d num">${cup(x.valor)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">Ninguno</td></tr>'}
         </table></div></div>`;
-  } else if (S.invSub === "fisico") {
-    cuerpo = `<div class="tarjeta"><h3>1. Generar lista para Arqueo</h3>
-      <p class="muted" style="font-size:.86rem">Descarga un JSON filtrado e impórtalo en Arqueo Stock (o úsalo como guía de conteo).</p>
-      <label class="chk"><input type="checkbox" id="arqSoloMin"> Solo bajo mínimo / reponer</label>
-      <label class="campo">Clase ABC (opcional)
-        <select id="arqClase"><option value="">Todas</option><option value="A">A</option><option value="B">B</option><option value="C">C</option></select>
-      </label>
-      <button class="btn sec" data-act="genListaArqueo">Descargar lista JSON</button>
-    </div>
-    <div class="tarjeta"><h3>2. Comparar conteo físico vs sistema</h3>
-      <p class="muted" style="font-size:.86rem">Arqueo → Stock en vivo → IP de esta PC y puerto (ej. 3000). Tras contar, exporta JSON y cárgalo aquí.</p>
-      <input type="file" id="arqueoFile" accept=".json,application/json" style="margin:10px 0">
+  } else if (S.invSub === "arqueo") {
+    cuerpo = `<div class="tarjeta"><h3>1. Lista para Arqueo</h3>
+      <p class="muted">Descarga JSON filtrado e impórtalo en Arqueo Stock.</p>
+      <label class="chk"><input type="checkbox" id="arqSoloMin"> Solo bajo mínimo</label>
+      <button class="btn" data-act="genListaArqueo">Descargar lista JSON</button></div>
+      <div class="tarjeta"><h3>2. Comparar conteo físico</h3>
+      <input type="file" id="arqueoFile" accept="application/json,.json">
       <button class="btn" data-act="importArqueo">Comparar con el sistema</button>
-      <button class="btn sec" data-act="importArqueoAjustes">Informe de ajustes (para AxisPOS)</button>
+      <button class="btn sec" data-act="importArqueoAjustes">Informe de ajustes</button>
       <div id="fisicoRes"></div></div>`;
   } else if (S.invSub === "abc") {
-    const d = await get("/api/abc", { clase: S.abcClase });
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "abc", clase: S.abcClase }));
     const nombres = { A: "Clase A · alta rotación", B: "Clase B · media", C: "Clase C · baja", S: "Sin movimiento" };
     cuerpo = `<div class="kpis">${["A", "B", "C"].map((c) => `<div class="kpi"><span>${nombres[c]}</span><b class="num">${fmt(d.clases[c].pct * 100, 0)} % de las ventas</b><small>${d.clases[c].n} productos · ${compacto(d.clases[c].importe)}</small></div>`).join("")}
       <div class="kpi"><span>Sin movimiento (${d.ventana} días)</span><b class="num">${d.sinMovimiento.n} productos</b><small>Capital detenido aprox. ${compacto(d.sinMovimiento.capital)}</small></div></div>
@@ -1118,21 +1224,22 @@ vistas.inventario = async () => {
       <div class="scroll"><table><tr><th>Producto</th><th>Familia</th><th class="d">Stock</th><th class="d">Vendido</th><th class="d">Importe</th>${S.abcClase === "S" ? "" : '<th class="d">% acum.</th>'}</tr>
       ${d.filas.map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(x.familia)}</td><td class="d num">${fmt(x.stock, 1)}</td><td class="d num">${fmt(x.unidades, 0)}</td><td class="d num">${compacto(x.importe)}</td>${S.abcClase === "S" ? "" : `<td class="d num">${x.acum != null ? fmt(x.acum * 100, 0) + " %" : ""}</td>`}</tr>`).join("") || '<tr><td colspan="6" class="muted">Sin productos</td></tr>'}</table></div></div>`;
   } else {
-    const d = await get("/api/compras");
+    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "compras" }));
     S.comprasCsv = d.filas;
     cuerpo = `<div class="kpis"><div class="kpi"><span>Productos a pedir</span><b class="num">${d.total}</b></div><div class="kpi"><span>Costo estimado</span><b class="num">${cup(d.estimado)}</b><small>${d.sinCosto} sin costo cargado</small></div></div>
       <div class="tarjeta"><h3>Lista de compra <small><button class="link" data-act="csvCompras">Descargar CSV</button></small></h3><p class="muted" style="margin:-4px 0 8px;font-size:.84rem">Cantidad = venta diaria × (${d.cobertura} días de cobertura + ${d.seguridad} de seguridad) − lo que hay. Ordenada por importancia (clase A primero) y urgencia. Venta medida en los últimos ${d.ventana} días.</p>
       <div class="scroll"><table><tr><th>Producto</th><th>Clase</th><th class="d">Stock</th><th class="d">Alcanza</th><th class="d">Pedir</th><th class="d">Costo est.</th></tr>
       ${d.filas.map((x) => `<tr><td>${e(x.nombre)}</td><td>${x.clase}</td><td class="d num">${fmt(x.stock, 1)}</td><td class="d num">${x.cobertura != null ? fmt(x.cobertura, 1) + " d" : "—"}</td><td class="d num"><b>${fmt(x.pedir, 0)}</b></td><td class="d num">${x.estimado != null ? compacto(x.estimado) : "—"}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Nada por pedir por ahora</td></tr>'}</table></div></div>`;
   }
-  if (aqui(tk)) $("#contenido").innerHTML = `${cab("Inventario", "Alertas, IPV valorado, traspasos almacén→PV, ABC y compras.")}${tabs}${cuerpo}`;
+  if (aqui(tk)) $("#contenido").innerHTML = `${cab("Stock", "Alertas, IPV valorado, traspasos almacén→PV, ABC y compras.")}${tabs}${cuerpo}`;
 };
 
 // ---------- Pérdidas ----------
 const TIPOS_EV = [["cancel", "Cancelaciones"], ["anular", "Anulaciones"], ["elim", "Líneas quitadas"], ["desc", "Descuentos"], ["precio", "Cambios de precio"], ["cierre", "Cierres de caja"], ["login", "Accesos fallidos"], ["cajon", "Cajón abierto"], ["todo", "Todos los logs"]];
 vistas.perdidas = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["informe", "Informe"], ["auditoria", "Auditoría"], ["alertas", "Alertas"], ["mermas", "Mermas"], ["devoluciones", "Devoluciones"], ["patrones", "Patrones anulación"], ["eventos", "Eventos"]], S.perSub, "perSub");
+  if (["auditoria", "alertas", "patrones"].includes(S.perSub)) S.perSub = "informe";
+  const tabs = subTabs([["informe", "Informe"], ["eventos", "Eventos"], ["mermas", "Mermas"], ["devoluciones", "Devoluciones"]], S.perSub, "perSub");
   let cuerpo = "";
   if (S.perSub === "informe") {
     const d = await get("/api/informe-auditoria", paramsPeriodo());
@@ -1140,120 +1247,71 @@ vistas.perdidas = async () => {
     const m = d.meta || {};
     const r = d.resumenEjecutivo || {};
     const det = d.detalle || {};
-    const sec = (titulo, body) => `<div class="tarjeta"><h3>${titulo}</h3>${body}</div>`;
     const mismoDia = m.desde && m.hasta && m.desde === m.hasta;
+    const badge = (nivel) => `<span class="etiqueta et-${nivel === "ok" ? "ok" : nivel === "alta" ? "alta" : "media"}">${nivel}</span>`;
+    const sec = (num, titulo, body) => `<section class="inf-sec"><header class="inf-sec-h"><span class="inf-num">${num}</span><h3>${titulo}</h3></header><div class="inf-sec-b">${body}</div></section>`;
     cuerpo = `
-      <div class="tarjeta" style="border-left:3px solid var(--azul,#2563eb)">
-        <p style="margin:0;font-size:.9rem"><b>Período del informe:</b> ${mismoDia ? "día " + e(m.desde) : e(m.desde) + " → " + e(m.hasta)}</p>
-        <p class="muted" style="margin:6px 0 0;font-size:.82rem">Arriba elige <b>Hoy</b>, <b>7 días</b>… o <b>Fechas</b>, pon el día (desde = hasta = ese día) y pulsa <b>Aplicar</b>.</p>
-      </div>
-      ${sec("1. Resumen ejecutivo", `
-        <p style="margin:0 0 10px;line-height:1.45">${e(r.texto || "")}</p>
-        <div class="kpis">
-          <div class="kpi"><span>Ventas</span><b class="num">${cup(r.ventas)}</b><small>${fmt(r.tickets,0)} tickets</small></div>
-          <div class="kpi"><span>Faltante</span><b class="num" style="color:var(--rojo)">${cup(r.faltante)}</b></div>
-          <div class="kpi"><span>Sobrante</span><b class="num" style="color:var(--verde)">${cup(r.sobrante)}</b></div>
-          <div class="kpi"><span>Neto comunal</span><b class="num">${cup(r.netoComunal)}</b></div>
-          <div class="kpi"><span>Sin contar / tarjeta</span><b class="num">${fmt(r.cerradosSinContar,0)} / ${fmt(r.ticketsTarjeta,0)}</b></div>
-          <div class="kpi"><span>Stock negativo</span><b class="num">${fmt(r.stockNegativo,0)}</b></div>
+      <div class="inf-hero">
+        <div>
+          <p class="inf-kicker">Informe de auditoría operativa</p>
+          <h2 class="inf-title">${mismoDia ? "Día " + e(m.desde) : e(m.desde) + " → " + e(m.hasta)}</h2>
+          <p class="inf-sub">Efectivo (DiffClose), logs AxisPOS, inventario y señales por persona · tolerancia ${fmt(m.toleranciaCaja, 0)} CUP</p>
         </div>
-        <p class="muted" style="font-size:.82rem;margin:8px 0 0">Período ${e(m.desde)} – ${e(m.hasta)} · tolerancia caja ${fmt(m.toleranciaCaja,0)} CUP</p>
-      `)}
-      ${sec("2. Alcance, fuentes y método", `
-        <p><b>Fuentes</b></p><ul>${(m.fuentes||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ul>
-        <p><b>Método</b></p><ul>${(m.metodo||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ul>
-      `)}
-      ${sec("3. Hallazgos detallados", `
-        ${(d.hallazgos||[]).map((h)=>`<div class="fila"><span class="etiqueta et-${h.nivel==="ok"?"ok":h.nivel==="alta"?"alta":"media"}">${e(h.nivel)}</span>
-          <div style="margin-left:8px"><b>${e(h.titulo)}</b><small>${e(h.texto)}</small></div></div>`).join("")}
-      `)}
-      ${sec("4. Tickets por tarjeta (conciliar con banco)", `
-        <p class="muted" style="font-size:.84rem">Axis registra el cobro tarjeta; Admin POS no ve el banco. Cruza estos montos con el extracto.</p>
-        <div class="scroll"><table><tr><th>Turno</th><th>Ticket</th><th>Cajero</th><th>Local</th><th class="d">Monto</th></tr>
-        ${(det.tarjetaSinBanco||[]).map((x)=>`<tr class="clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer">
-          <td class="num">${e(x.turno||"")}</td><td class="link num">${x.ticket}</td><td>${e(x.cajero)}</td><td>${e(x.local)}</td><td class="d num">${cup(x.monto)}</td></tr>`).join("")
-          || '<tr><td colspan="5" class="muted">Ninguno en el período</td></tr>'}
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <button class="btn sec chico" data-act="exportInformeCsv">CSV</button>
+          <button class="btn sec chico" data-act="exportInformePdf">PDF</button>
+          <button class="btn sec chico" data-act="printVista">Imprimir</button>
+        </div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><span>Ventas</span><b class="num">${cup(r.ventas)}</b><small>${fmt(r.tickets, 0)} tickets</small></div>
+        <div class="kpi"><span>Faltante</span><b class="num" style="color:var(--rojo)">${cup(r.faltante)}</b></div>
+        <div class="kpi"><span>Sobrante</span><b class="num" style="color:var(--verde)">${cup(r.sobrante)}</b></div>
+        <div class="kpi"><span>Neto comunal</span><b class="num">${cup(r.netoComunal)}</b></div>
+        <div class="kpi"><span>Sin contar</span><b class="num">${fmt(r.cerradosSinContar, 0)}</b></div>
+        <div class="kpi"><span>Stock −</span><b class="num">${fmt(r.stockNegativo, 0)}</b></div>
+      </div>
+      ${sec("01", "Resumen ejecutivo", `<p class="inf-lead">${e(r.texto || "")}</p>`)}
+      ${sec("02", "Hallazgos", `<div class="inf-hallazgos">${(d.hallazgos || []).map((h) => `<div class="inf-hallazgo">${badge(h.nivel)}<div><strong>${e(h.titulo)}</strong><p>${e(h.texto)}</p></div></div>`).join("")}</div>`)}
+      ${sec("03", "Caja", `<div class="scroll"><table>
+          <tr><th>Apertura</th><th>Quién</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Diff</th><th>Nota</th></tr>
+          ${(det.parcialesCero || []).map((x) => `<tr><td class="num">${fechaHora(x.apertura)}</td><td>${e(x.usuario || "")}</td><td class="d num">${cup(x.esperado)}</td><td class="d num">${cup(x.contado)}</td><td class="d num">${cup(x.diferencia)}</td><td><span class="etiqueta et-media">Sin contar</span></td></tr>`).join("")}
+          ${(det.turnosConDiferencia || []).map((x) => `<tr><td class="num">${fechaHora(x.apertura)}</td><td>${e(x.usuario || "")}</td><td class="d num">${cup(x.esperado)}</td><td class="d num">${cup(x.contado)}</td><td class="d num">${cup(x.diferencia)}</td><td><span class="etiqueta et-media">Fuera tol.</span></td></tr>`).join("")}
+          ${!(det.parcialesCero || []).length && !(det.turnosConDiferencia || []).length ? '<tr><td colspan="6" class="muted">Sin incidencias</td></tr>' : ""}
+        </table></div>`)}
+      ${sec("04", "Tarjeta (conciliar banco)", `<div class="scroll"><table><tr><th>Turno</th><th>Ticket</th><th>Cajero</th><th class="d">Monto</th></tr>
+        ${(det.tarjetaSinBanco || []).slice(0, 40).map((x) => `<tr class="clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer"><td class="num">${e(x.turno || "")}</td><td class="link num">${x.ticket}</td><td>${e(x.cajero)}</td><td class="d num">${cup(x.monto)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">Ninguno</td></tr>'}
+        </table></div>`)}
+      ${sec("05", "Anulaciones y cancelaciones", `<div class="inf-cols">
+          <div><h4>Anulaciones</h4>${(det.anulaciones || []).slice(0, 20).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("") || '<p class="muted">Ninguna</p>'}</div>
+          <div><h4>Cancelaciones</h4>${(det.cancelaciones || []).slice(0, 20).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("") || '<p class="muted">Ninguna</p>'}</div>
+        </div>`)}
+      ${sec("06", "Casa, stock y precios", `
+        <h4>Consumo / casa</h4>
+        <div class="scroll"><table><tr><th>Cuándo</th><th>Producto</th><th class="d">Importe</th></tr>
+        ${(det.consumoCasa || []).map((x) => `<tr><td class="num">${fechaHora(x.fecha)}</td><td>${e(x.producto)}</td><td class="d num">${cup(x.importe)}</td></tr>`).join("") || '<tr><td colspan="3" class="muted">Sin datos</td></tr>'}
         </table></div>
-      `)}
-      ${sec("5. Parcial / cierre como cuenta a casa $0", `
-        <div class="scroll"><table><tr><th>Apertura</th><th>Quién</th><th class="d">Libro</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">DiffClose</th></tr>
-        ${(det.parcialesCero||[]).map((t)=>`<tr>
-          <td class="num">${fechaHora(t.apertura)}</td><td>${e(t.usuario||"")}</td>
-          <td class="d num">${cup(t.libroCaja||0)}</td><td class="d num">${cup(t.esperado)}</td>
-          <td class="d num">${cup(t.contado)}</td><td class="d num">${cup(t.diferencia)}</td></tr>`).join("")
-          || '<tr><td colspan="6" class="muted">Ningún cierre sin conteo</td></tr>'}
+        <h4 style="margin-top:12px">Stock negativo</h4>
+        <div class="scroll"><table><tr><th>Código</th><th>Producto</th><th class="d">Stock</th></tr>
+        ${(det.stockNegativo || []).map((x) => `<tr><td class="muted">${e(x.codigo)}</td><td>${e(x.nombre)}</td><td class="d num" style="color:var(--rojo)">${fmt(x.stock, 2)}</td></tr>`).join("") || '<tr><td colspan="3" class="muted">Ninguno</td></tr>'}
         </table></div>
-      `)}
-      ${sec("6. Anulaciones de ventas", `
-        ${(det.anulaciones||[]).slice(0,40).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
-          || '<p class="muted">Sin anulaciones en el log</p>'}
-      `)}
-      ${sec("7. Consumo de la casa", `
-        <div class="scroll"><table><tr><th>Cuándo</th><th>Producto</th><th>Usuario</th><th>Socio</th><th class="d">Cant.</th><th class="d">Importe</th></tr>
-        ${(det.consumoCasa||[]).map((x)=>`<tr>
-          <td class="num">${fechaHora(x.fecha)}</td><td>${e(x.producto)}<small>${e(x.nota||"")}</small></td>
-          <td>${e(x.usuario)}</td><td>${e(x.socio)}</td>
-          <td class="d num">${fmt(x.cant,1)}</td><td class="d num">${cup(x.importe)}</td></tr>`).join("")
-          || '<tr><td colspan="6" class="muted">Sin movimientos detectados como casa/consumo</td></tr>'}
-        </table></div>
-      `)}
-      ${sec("8. Inventario y precios", `
-        <h4 style="margin:0 0 6px">Stock negativo</h4>
-        <div class="scroll"><table><tr><th>Código</th><th>Producto</th><th class="d">Stock</th><th class="d">Precio</th></tr>
-        ${(det.stockNegativo||[]).map((x)=>`<tr><td class="muted">${e(x.codigo)}</td><td>${e(x.nombre)}</td>
-          <td class="d num" style="color:var(--rojo)">${fmt(x.stock,2)}</td><td class="d num">${cup(x.precio)}</td></tr>`).join("")
-          || '<tr><td colspan="4" class="muted">Sin stock negativo</td></tr>'}
-        </table></div>
-        <h4 style="margin:12px 0 6px">Cambios de precio</h4>
-        ${(det.cambiosPrecio||[]).slice(0,30).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
-          || '<p class="muted">Sin cambios de precio</p>'}
-        <h4 style="margin:12px 0 6px">Productos / líneas eliminadas (log)</h4>
-        ${(det.productosEliminados||[]).slice(0,25).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
-          || '<p class="muted">Sin eliminaciones en el log</p>'}
-      `)}
-      ${sec("9. Conclusiones por persona", `
-        ${(d.conclusionesPorPersona||[]).map((c)=>`<div class="fila" style="align-items:flex-start">
-          <div><b>${e(c.nombre)}</b><small>${e(c.resumen)}</small>
-          <div style="margin-top:4px">${(c.señales||[]).map((s)=>`<span class="etiqueta et-${s.nivel==="ok"?"ok":s.nivel==="alta"?"alta":"media"}">${e(s.texto)}</span> `).join("")}</div>
-          </div></div>`).join("") || '<p class="muted">Sin datos de personal</p>'}
-      `)}
-      ${sec("10. Fichas de trabajadores", `
-        <div class="scroll"><table>
-          <tr><th>Nombre</th><th class="d">Ventas</th><th class="d">Tickets</th><th class="d">Anul.</th><th class="d">Cancel.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Comunal</th><th class="d">Sin contar</th></tr>
-          ${(d.fichasTrabajadores||[]).map((f)=>`<tr>
-            <td>${e(f.nombre)}</td>
-            <td class="d num">${compacto(f.ventas)}</td>
-            <td class="d num">${fmt(f.tickets,0)}</td>
-            <td class="d num">${fmt(f.anulaciones,0)}</td>
-            <td class="d num">${fmt(f.cancelaciones,0)}</td>
-            <td class="d num" style="color:var(--rojo)">${f.faltante?cup(f.faltante):"—"}</td>
-            <td class="d num" style="color:var(--verde)">${f.sobrante?cup(f.sobrante):"—"}</td>
+        <h4 style="margin-top:12px">Cambios de precio y eliminaciones</h4>
+        ${(det.cambiosPrecio || []).slice(0, 15).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}
+        ${(det.productosEliminados || []).slice(0, 10).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}`}
+      ${sec("07", "Fichas por persona", `<div class="scroll"><table>
+          <tr><th>Nombre</th><th class="d">Ventas</th><th class="d">Anul.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Comunal</th><th>Señales</th></tr>
+          ${(d.fichasTrabajadores || []).map((f) => `<tr>
+            <td>${e(f.nombre)}</td><td class="d num">${compacto(f.ventas)}</td><td class="d num">${fmt(f.anulaciones, 0)}</td>
+            <td class="d num" style="color:var(--rojo)">${f.faltante ? cup(f.faltante) : "—"}</td>
+            <td class="d num" style="color:var(--verde)">${f.sobrante ? cup(f.sobrante) : "—"}</td>
             <td class="d num">${cup(f.netoComunal)}</td>
-            <td class="d num">${fmt(f.sinContar,0)}</td>
+            <td>${(f.señales || []).map((s) => badge(s.nivel)).join(" ")}</td>
           </tr>`).join("")}
-        </table></div>
-      `)}
-      ${sec("11. Evidencia parcial vs final / arqueos con ajuste", `
-        <h4 style="margin:0 0 6px">Log (parcial, final, cierre, reconteo)</h4>
-        ${(det.evidenciasParcialFinal||[]).slice(0,40).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
-          || '<p class="muted">Sin mensajes de este tipo</p>'}
-        <h4 style="margin:12px 0 6px">Arqueos / ajustes en log</h4>
-        ${(det.arqueosAjustes||[]).slice(0,30).map((x)=>`<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")
-          || '<p class="muted">Sin entradas</p>'}
-        <h4 style="margin:12px 0 6px">Turnos fuera de tolerancia</h4>
-        <div class="scroll"><table><tr><th>Apertura</th><th>Quién</th><th class="d">Esperado</th><th class="d">Contado</th><th class="d">Dif.</th></tr>
-        ${(det.turnosConDiferencia||[]).map((t)=>`<tr>
-          <td class="num">${fechaHora(t.apertura)}</td><td>${e(t.usuario||"")}</td>
-          <td class="d num">${cup(t.esperado)}</td><td class="d num">${cup(t.contado)}</td>
-          <td class="d num">${cup(t.diferencia)}</td></tr>`).join("")
-          || '<tr><td colspan="5" class="muted">Ninguno</td></tr>'}
-        </table></div>
-      `)}
-      ${sec("12. Recomendaciones", `<ol>${(d.recomendaciones||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ol>`)}
-      ${sec("13. Limitaciones y anexos", `
-        <ul>${(d.limitaciones||[]).map((x)=>`<li>${e(x)}</li>`).join("")}</ul>
-        <p class="muted" style="font-size:.84rem">Anexo sugerido: exportar este período + backup .woback + extracto bancario de los días con tarjeta.</p>
-      `)}
+        </table></div>`)}
+      ${sec("08", "Recomendaciones", `<ol class="inf-ol">${(d.recomendaciones || []).map((x) => `<li>${e(x)}</li>`).join("")}</ol>`)}
+      ${sec("09", "Método y limitaciones", `
+        <ul class="inf-ul">${(m.fuentes || []).map((x) => `<li>${e(x)}</li>`).join("")}</ul>
+        <ul class="inf-ul">${(d.limitaciones || []).map((x) => `<li>${e(x)}</li>`).join("")}</ul>`)}
     `;
   } else if (S.perSub === "auditoria") {
 
@@ -1370,7 +1428,7 @@ vistas.perdidas = async () => {
           <small>${e(x.mensaje)}</small></div>
         <div class="d muted num">${fechaHora(x.fecha + ":00")}</div></div>`).join("") || '<p class="muted">Sin eventos.</p>'}${pager(d.pagina, d.paginas)}</div>`;
   }
-  if (aqui(tk)) $("#contenido").innerHTML = `${cab("Pérdidas", "Señales para prevenir pérdidas: cancelaciones, descuentos, cierres de caja y mermas.")}${tabs}${cuerpo}`;
+  if (aqui(tk)) $("#contenido").innerHTML = `${cab("Control", "Informe unificado de auditoría, eventos, mermas y devoluciones.")}${tabs}${cuerpo}`;
 };
 
 // ---------- Ajustes ----------
@@ -1540,6 +1598,11 @@ const ACC = {
   cortina: (el, ev) => { if (ev.target === el) cerrarModal(); },
   cerrarModal,
   ir: (el) => { cerrarModal(); ir(el.dataset.v); },
+  cajaFiltro: (el) => {
+    S.cajaFiltro = el.dataset.v || "todos";
+    S.cajaPag = 1;
+    vista(true);
+  },
   periodo: (el) => {
     S.periodo = el.dataset.v;
     if (S.periodo !== "custom") LS.set("periodoPref", S.periodo);
@@ -1667,6 +1730,36 @@ const ACC = {
     }
   },
   printVista: () => window.print(),
+  exportInformeCsv: async () => {
+    try {
+      const d = await get("/api/informe-auditoria", paramsPeriodo());
+      const r = d.resumenEjecutivo || {};
+      const filas = [
+        ["Sección", "Campo", "Valor"],
+        ["Resumen", "Desde", d.meta?.desde || ""],
+        ["Resumen", "Hasta", d.meta?.hasta || ""],
+        ["Resumen", "Ventas", r.ventas],
+        ["Resumen", "Tickets", r.tickets],
+        ["Resumen", "Faltante", r.faltante],
+        ["Resumen", "Sobrante", r.sobrante],
+        ["Resumen", "Neto comunal", r.netoComunal],
+        ["Resumen", "Sin contar", r.cerradosSinContar],
+        ["Resumen", "Stock negativo", r.stockNegativo],
+      ];
+      for (const h of d.hallazgos || []) filas.push(["Hallazgo", h.nivel, h.titulo + " — " + h.texto]);
+      for (const f of d.fichasTrabajadores || []) {
+        filas.push(["Ficha", f.nombre, `ventas=${f.ventas};anul=${f.anulaciones};falt=${f.faltante};sobr=${f.sobrante};comunal=${f.netoComunal}`]);
+      }
+      for (const x of (d.detalle?.anulaciones || []).slice(0, 100)) filas.push(["Anulación", x.fecha + " " + x.usuario, x.mensaje]);
+      for (const x of (d.detalle?.stockNegativo || [])) filas.push(["Stock-", x.codigo, `${x.nombre}=${x.stock}`]);
+      await descargarCSV(`informe-auditoria-${d.meta?.desde || "x"}-${d.meta?.hasta || "x"}.csv`, filas);
+      aviso("Informe CSV descargado");
+    } catch (err) { aviso(err.message); }
+  },
+  exportInformePdf: () => {
+    // PDF vía diálogo de impresión del sistema (sin librerías)
+    window.print();
+  },
   genListaArqueo: async () => {
     try {
       const soloMin = $("#arqSoloMin")?.checked ? "1" : "0";

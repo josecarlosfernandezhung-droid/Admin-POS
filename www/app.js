@@ -925,23 +925,23 @@ vistas.caja = async () => {
     return `<span class="etiqueta et-${t.nivel === "alta" ? "alta" : "media"}">Sobrante ${fmt(Math.abs(v), 0)}</span>`;
   };
   const netoComunal = Math.round(((d.faltante || 0) - (d.sobrante || 0)) * 100) / 100;
-  $("#contenido").innerHTML = `${cab("Caja", "Faltantes, sobrantes y resumen comunal del efectivo por turno.")}
+  $("#contenido").innerHTML = `${cab("Caja", "Faltantes, sobrantes y neto de efectivo por turno.")}
     <div class="kpis">
       <div class="kpi"><span>Faltante (período)</span><b class="num" style="color:var(--rojo)">${cup(d.faltante || 0)}</b><small>contó de menos vs libro</small></div>
       <div class="kpi"><span>Sobrante (período)</span><b class="num" style="color:var(--verde)">${cup(d.sobrante || 0)}</b><small>contó de más vs libro</small></div>
-      <div class="kpi"><span>Neto comunal</span><b class="num" style="color:${netoComunal > 0 ? "var(--rojo)" : netoComunal < 0 ? "var(--verde)" : "inherit"}">${cup(netoComunal)}</b><small>faltantes − sobrantes (lo que asume el negocio)</small></div>
+      <div class="kpi"><span>Neto</span><b class="num" style="color:${netoComunal > 0 ? "var(--rojo)" : netoComunal < 0 ? "var(--verde)" : "inherit"}">${cup(netoComunal)}</b><small>faltantes − sobrantes</small></div>
       <div class="kpi"><span>Turnos</span><b class="num">${d.turnos}</b><small>${d.conDiferencia || 0} fuera tol. (${fmt(d.tolerancia, 0)}) · ${fmt(d.cerradosSinContar || 0, 0)} sin contar</small></div>
     </div>
     <div class="tarjeta"><h3>Qué significa cada cosa</h3>
       <p class="muted" style="margin:0;font-size:.86rem">
         <b>Faltante</b>: al cerrar había <i>menos</i> efectivo del que el libro de caja esperaba (DiffClose &gt; 0).<br>
         <b>Sobrante</b>: había <i>más</i> efectivo del esperado (DiffClose &lt; 0).<br>
-        <b>Neto comunal</b>: suma de faltantes menos sobrantes del período (solo turnos <b>con conteo</b>; los “sin contar” no suman).<br>
+        <b>Neto</b>: suma de faltantes menos sobrantes del período (solo turnos <b>con conteo</b>; los “sin contar” no suman).<br>
         <b>Esperado</b> = fondo + libro de caja del turno − retiros (igual que AxisPOS). Tolerancia: ${fmt(d.tolerancia, 0)} CUP (Ajustes).
       </p></div>
     ${(d.porCajero && d.porCajero.length) ? `<div class="tarjeta"><h3>Faltantes y sobrantes por cajero</h3>
       <div class="scroll"><table>
-        <tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Fuera tol.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto comunal</th><th class="d">Máx. faltante</th><th class="d">Máx. sobrante</th><th class="d">Sin contar</th></tr>
+        <tr><th>Cajero</th><th class="d">Turnos</th><th class="d">Fuera tol.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto</th><th class="d">Máx. faltante</th><th class="d">Máx. sobrante</th><th class="d">Sin contar</th></tr>
         ${d.porCajero.map((c) => {
           const neto = (c.faltante || 0) - (c.sobrante || 0);
           return `<tr>
@@ -957,7 +957,7 @@ vistas.caja = async () => {
           </tr>`;
         }).join("")}
       </table></div>
-      <p class="muted" style="margin:8px 0 0;font-size:.82rem">El neto comunal por cajero ayuda a ver quién aporta más faltante o sobrante al total del negocio.</p>
+      <p class="muted" style="margin:8px 0 0;font-size:.82rem">El neto por cajero muestra quién aporta más faltante o sobrante.</p>
     </div>` : ""}
     <div class="tarjeta"><h3>Turnos del período</h3>
       ${filtrosHtml}
@@ -1267,7 +1267,7 @@ vistas.perdidas = async () => {
         <div class="kpi"><span>Ventas</span><b class="num">${cup(r.ventas)}</b><small>${fmt(r.tickets, 0)} tickets</small></div>
         <div class="kpi"><span>Faltante</span><b class="num" style="color:var(--rojo)">${cup(r.faltante)}</b></div>
         <div class="kpi"><span>Sobrante</span><b class="num" style="color:var(--verde)">${cup(r.sobrante)}</b></div>
-        <div class="kpi"><span>Neto comunal</span><b class="num">${cup(r.netoComunal)}</b></div>
+        <div class="kpi"><span>Neto</span><b class="num">${cup(r.netoComunal)}</b></div>
         <div class="kpi"><span>Sin contar</span><b class="num">${fmt(r.cerradosSinContar, 0)}</b></div>
         <div class="kpi"><span>Stock −</span><b class="num">${fmt(r.stockNegativo, 0)}</b></div>
       </div>
@@ -1299,7 +1299,7 @@ vistas.perdidas = async () => {
         ${(det.cambiosPrecio || []).slice(0, 15).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}
         ${(det.productosEliminados || []).slice(0, 10).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}`}
       ${sec("07", "Fichas por persona", `<div class="scroll"><table>
-          <tr><th>Nombre</th><th class="d">Ventas</th><th class="d">Anul.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Comunal</th><th>Señales</th></tr>
+          <tr><th>Nombre</th><th class="d">Ventas</th><th class="d">Anul.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto</th><th>Señales</th></tr>
           ${(d.fichasTrabajadores || []).map((f) => `<tr>
             <td>${e(f.nombre)}</td><td class="d num">${compacto(f.ventas)}</td><td class="d num">${fmt(f.anulaciones, 0)}</td>
             <td class="d num" style="color:var(--rojo)">${f.faltante ? cup(f.faltante) : "—"}</td>
@@ -1742,13 +1742,13 @@ const ACC = {
         ["Resumen", "Tickets", r.tickets],
         ["Resumen", "Faltante", r.faltante],
         ["Resumen", "Sobrante", r.sobrante],
-        ["Resumen", "Neto comunal", r.netoComunal],
+        ["Resumen", "Neto", r.netoComunal],
         ["Resumen", "Sin contar", r.cerradosSinContar],
         ["Resumen", "Stock negativo", r.stockNegativo],
       ];
       for (const h of d.hallazgos || []) filas.push(["Hallazgo", h.nivel, h.titulo + " — " + h.texto]);
       for (const f of d.fichasTrabajadores || []) {
-        filas.push(["Ficha", f.nombre, `ventas=${f.ventas};anul=${f.anulaciones};falt=${f.faltante};sobr=${f.sobrante};comunal=${f.netoComunal}`]);
+        filas.push(["Ficha", f.nombre, `ventas=${f.ventas};anul=${f.anulaciones};falt=${f.faltante};sobr=${f.sobrante};neto=${f.netoComunal}`]);
       }
       for (const x of (d.detalle?.anulaciones || []).slice(0, 100)) filas.push(["Anulación", x.fecha + " " + x.usuario, x.mensaje]);
       for (const x of (d.detalle?.stockNegativo || [])) filas.push(["Stock-", x.codigo, `${x.nombre}=${x.stock}`]);

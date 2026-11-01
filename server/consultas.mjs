@@ -3,20 +3,14 @@
 
 // Fecha real de la venta: UserRealTime si es válida, si no Date
 const F = "IF(o.UserRealTime BETWEEN '2020-01-01' AND '2036-12-31 23:59:59', o.UserRealTime, o.`Date`)";
-const IMP = "(ABS(o.Qtty) * o.PriceOut * (1 - IF(o.Discount BETWEEN 0 AND 100, o.Discount, 0) / 100))";
-const VENTA = "o.OperType = 2 AND COALESCE(o.Sign, 0) <= 0";
+// PriceOut en Axis ya trae el precio cobrado; Discount es solo informativo (no volver a restar).
+const IMP = "(ABS(o.Qtty) * o.PriceOut)";
+// Sign -1 = venta finalizada en Axis; Sign 0 = sin finalizar / anulada en borrador
+const VENTA = "o.OperType = 2 AND COALESCE(o.Sign, 0) < 0";
 const DEVOL = "o.OperType = 34";
 const RANGO = `${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY)`;
 const PRECIO = "COALESCE(NULLIF(g.PriceOut2,0), NULLIF(g.PriceOut1,0), NULLIF(g.PriceOut3,0), 0)";
-// Almacenes que el administrador decidió no mostrar (Ajustes → Almacenes visibles)
-let OCULTOS = [];
-export function fijarAlmacenesOcultos(lista) {
-  OCULTOS = (Array.isArray(lista) ? lista : []).map(Number).filter((n) => Number.isInteger(n));
-}
-const noOculto = (col) => (OCULTOS.length ? ` AND ${col} NOT IN (${OCULTOS.join(",")})` : "");
-const whereStore = () => (OCULTOS.length ? ` WHERE ObjectID NOT IN (${OCULTOS.join(",")})` : "");
-// Se evalúa al armar cada consulta, así siempre respeta los almacenes ocultos actuales
-const STOCK = { toString: () => `(SELECT GoodID, SUM(Qtty) AS cant FROM store${whereStore()} GROUP BY GoodID)` };
+const STOCK = "(SELECT GoodID, SUM(Qtty) AS cant FROM store GROUP BY GoodID)";
 
 const ymd = (d) => d.toISOString().slice(0, 10);
 export const sumarDias = (s, n) => {
@@ -127,10 +121,11 @@ export async function resumen(pool, ctx) {
       una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS docs FROM operations o WHERE ${DEVOL} AND ${RANGO}${U}`, P),
       ctx.r.todo ? Promise.resolve(null) : totalVentas(pool, ctx, ctx.r.aDesde, ctx.r.aHasta),
       porHora(pool, ctx, desde, hasta),
-      filas(pool, `SELECT DATE_FORMAT(${F},'%Y-%m-%d') AS dia, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} AND ${RANGO}${U} GROUP BY dia ORDER BY dia`, P),
-      filas(pool, `SELECT g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia, SUM(ABS(o.Qtty)) AS unidades, SUM(${IMP}) AS total
+      filas(pool, `SELECT DATE_FORMAT(${F},'%Y-%m-%d') AS dia, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS tickets, COALESCE(SUM(ABS(o.Qtty)),0) AS unidades FROM operations o WHERE ${VENTA} AND ${RANGO}${U} GROUP BY dia ORDER BY dia`, P),
+      filas(pool, `SELECT g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
+            SUM(ABS(o.Qtty)) AS unidades, SUM(${IMP}) AS total, SUM(${COSTO}) AS costo
         FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-        WHERE ${VENTA} AND ${RANGO}${U} GROUP BY o.GoodID, g.Name, gg.Name ORDER BY total DESC LIMIT 15`, P),
+        WHERE ${VENTA} AND ${RANGO}${U} GROUP BY o.GoodID, g.Code, g.Name, gg.Name ORDER BY total DESC LIMIT 80`, P),
       filas(pool, `SELECT COALESCE(gg.Name,'Sin grupo') AS familia,
             SUM(${IMP}) AS total, SUM(ABS(o.Qtty)) AS unidades, SUM(${COSTO}) AS costo
         FROM operations o LEFT JOIN goods g ON g.ID = o.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
@@ -155,6 +150,28 @@ export async function resumen(pool, ctx) {
   const total = num(tot.total);
   const tickets = num(tot.tickets);
   const costo = num(costoDesc.costo);
+  // Pagos registrados (efectivo / otros) en turnos del período
+  let pagoEfectivo = 0, pagoOtros = 0, pagosList = [];
+  try {
+    const pagos = await filas(
+      pool,
+      `SELECT COALESCE(p.Type, p.Mode, 0) AS tipo, COALESCE(SUM(p.Qtty),0) AS monto
+       FROM payments p
+       JOIN shift sh ON sh.ID = p.ShiftID
+       WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)
+         AND p.OperType = 2
+       GROUP BY COALESCE(p.Type, p.Mode, 0)`,
+      [desde, hasta]
+    );
+    for (const x of pagos) {
+      const m = num(x.monto);
+      // Mode/Type 1 suele ser efectivo en Axis
+      if (num(x.tipo) === 1) pagoEfectivo += m;
+      else pagoOtros += m;
+      pagosList.push({ tipo: num(x.tipo), monto: m });
+    }
+  } catch {}
+
   const descuentos = num(costoDesc.descuentos);
   const ganancia = total - costo;
   const pct = (a, b) => (b > 0 ? redondear(((a - b) / b) * 100, 1) : null);
@@ -163,12 +180,29 @@ export async function resumen(pool, ctx) {
     total, tickets, unidades: num(tot.unidades), promedio: tickets ? total / tickets : 0,
     devoluciones: num(dev.total), devDocs: num(dev.docs), neto: total - num(dev.total),
     costo, descuentos, ganancia,
+    pagoEfectivo, pagoOtros, pagosList,
+    totalLimpio: total - num(dev.total),
     margen: total > 0 ? ganancia / total : 0,
     costoPorPeso: total > 0 ? costo / total : 0,
     anterior: ant ? { total: ant.total, tickets: ant.tickets, variacion: pct(total, ant.total) } : null,
     porHora: horas.map((x) => ({ hora: num(x.hora), total: num(x.total), tickets: num(x.tickets) })),
-    porDia: dias.map((x) => ({ dia: x.dia, total: num(x.total), tickets: num(x.tickets) })),
-    top: top.map((x) => ({ nombre: x.nombre, familia: x.familia, unidades: num(x.unidades), total: num(x.total) })),
+    porDia: dias.map((x) => ({
+      dia: x.dia,
+      total: num(x.total),
+      tickets: num(x.tickets),
+      unidades: num(x.unidades),
+      promedio: num(x.tickets) ? num(x.total) / num(x.tickets) : 0,
+    })),
+    top: top.map((x) => ({
+      codigo: x.codigo || "",
+      nombre: x.nombre,
+      familia: x.familia,
+      unidades: num(x.unidades),
+      total: num(x.total),
+      costo: num(x.costo),
+      ganancia: num(x.total) - num(x.costo),
+      margen: num(x.total) > 0 ? (num(x.total) - num(x.costo)) / num(x.total) : 0,
+    })),
     familias: fam.map((x) => ({
       familia: x.familia,
       total: num(x.total),
@@ -569,21 +603,21 @@ export async function existencias(pool, ctx, q) {
   const pagina = Math.max(parseInt(q.pagina, 10) || 1, 1);
   const local = parseInt(q.local, 10);
   const params = [busca, busca];
-  let filtro = noOculto("s.ObjectID");
+  let filtro = "";
   if (Number.isInteger(local)) {
-    filtro += " AND s.ObjectID = ?";
+    filtro = " AND s.ObjectID = ?";
     params.push(local);
   }
   const base = `SELECT s.ObjectID AS lid, o.Name AS local, s.GoodID AS id, g.Name AS nombre, SUM(s.Qtty) AS cantidad
     FROM store s JOIN goods g ON g.ID = s.GoodID JOIN objects o ON o.ID = s.ObjectID
     WHERE (g.Name LIKE ? OR g.Code LIKE ?)${filtro} GROUP BY s.ObjectID, o.Name, s.GoodID, g.Name HAVING SUM(s.Qtty) > 0.0005`;
   const [kpi, agot, locales, [cuenta], lista] = await Promise.all([
-    una(pool, `SELECT COUNT(*) AS referencias, COALESCE(SUM(t.cant),0) AS piezas FROM (SELECT GoodID, SUM(Qtty) AS cant FROM store${whereStore()} GROUP BY GoodID HAVING SUM(Qtty) > 0.0005) t`),
+    una(pool, `SELECT COUNT(*) AS referencias, COALESCE(SUM(t.cant),0) AS piezas FROM (SELECT GoodID, SUM(Qtty) AS cant FROM store GROUP BY GoodID HAVING SUM(Qtty) > 0.0005) t`),
     filas(pool, `SELECT g.Name AS nombre, v.total AS importe
       FROM (SELECT o.GoodID, SUM(${IMP}) AS total FROM operations o WHERE ${VENTA} AND ${RANGO} GROUP BY o.GoodID) v
       JOIN goods g ON g.ID = v.GoodID LEFT JOIN ${STOCK} s ON s.GoodID = v.GoodID
       WHERE COALESCE(s.cant,0) <= 0.0005 ORDER BY v.total DESC`, [desde, hasta]),
-    filas(pool, `SELECT o.ID AS id, o.Name AS nombre, o.Deleted AS archivado FROM objects o WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty <> 0)${noOculto("o.ID")} ORDER BY o.Name`),
+    filas(pool, `SELECT o.ID AS id, o.Name AS nombre, o.Deleted AS archivado FROM objects o WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty <> 0) ORDER BY o.Name`),
     pool.query(`SELECT COUNT(*) AS n FROM (${base}) z`, params),
     filas(pool, `${base} ORDER BY cantidad DESC, nombre LIMIT 40 OFFSET ${(pagina - 1) * 40}`, params),
   ]);
@@ -623,7 +657,7 @@ export async function ipv(pool, ctx, q) {
 
   // --- Stock actual (existencia final) por producto ---
   const stockParams = [busca, busca, busca];
-  let stockFiltro = " AND COALESCE(g.Deleted,0) = 0" + noOculto("s.ObjectID");
+  let stockFiltro = " AND COALESCE(g.Deleted,0) = 0";
   if (tieneLocal) {
     stockFiltro += " AND s.ObjectID = ?";
     stockParams.push(local);
@@ -688,7 +722,7 @@ export async function ipv(pool, ctx, q) {
         mermas: 0,
         transferencias: 0,
         otros: 0,
-        netoMov: 0, // efecto real en existencia (según tipo de operación, no según el signo guardado)
+        netoMov: 0, // suma de Qtty firmada en el período
         importeVentas: 0,
         tipos: {},
       });
@@ -709,12 +743,7 @@ export async function ipv(pool, ctx, q) {
     }
     const vol = num(m.volumen);
     const neto = num(m.neto);
-    // AxisPOS no guarda siempre el mismo signo (las ventas pueden venir en positivo).
-    // El efecto sobre la existencia se decide por el TIPO de operación.
-    const SUMAN = [1, 12, 27, 34]; // entrada, recepción, traspaso entrante, devolución de venta
-    const RESTAN = [2, 3, 11, 26, 35]; // venta, merma, baja, traspaso saliente, devolución a proveedor
-    const efecto = SUMAN.includes(tipo) ? vol : RESTAN.includes(tipo) ? -vol : neto;
-    row.netoMov += efecto;
+    row.netoMov += neto;
     row.tipos[tipo] = { tipo, nombre: NOMBRE_OPER[tipo] || `Tipo ${tipo}`, volumen: vol, neto, importe: num(m.importe), n: num(m.n) };
 
     if (!tiposAgg[tipo]) tiposAgg[tipo] = { tipo, nombre: NOMBRE_OPER[tipo] || `Tipo ${tipo}`, volumen: 0, importe: 0, n: 0 };
@@ -727,7 +756,7 @@ export async function ipv(pool, ctx, q) {
       row.importeVentas += num(m.importe);
     } else if (tipo === 34) {
       row.devoluciones += vol;
-    } else if (tipo === 1 || tipo === 12 || tipo === 27) {
+    } else if (tipo === 1 || tipo === 12 || tipo === 27 || tipo === 35) {
       row.entradas += vol;
     } else if (tipo === 3 || tipo === 11) {
       row.mermas += vol;
@@ -764,9 +793,7 @@ export async function ipv(pool, ctx, q) {
   const pctCostoIpv = ctx.aj?.costoEstimadoPct ?? 10;
   const filasMov = [...porProd.values()].map((p) => {
     const final = p.final;
-    // La existencia inicial nunca puede ser negativa: si el cálculo da menos de 0,
-    // el registro de entradas está incompleto y se muestra 0.
-    const inicio = Math.max(0, redondear(final - p.netoMov, 3));
+    const inicio = redondear(final - p.netoMov, 3);
     const costoU = costoDe(p.costoUnit, p.precioUnit, pctCostoIpv);
     return {
       id: p.id,
@@ -810,7 +837,7 @@ export async function ipv(pool, ctx, q) {
 
   // Stock valorado por local (como antes)
   const stockLocalParams = [busca, busca, busca];
-  let stockLocalFiltro = " AND COALESCE(g.Deleted,0) = 0" + noOculto("s.ObjectID");
+  let stockLocalFiltro = " AND COALESCE(g.Deleted,0) = 0";
   if (tieneLocal) {
     stockLocalFiltro += " AND s.ObjectID = ?";
     stockLocalParams.push(local);
@@ -841,7 +868,7 @@ export async function ipv(pool, ctx, q) {
   const locales = await filas(
     pool,
     `SELECT o.ID AS id, o.Name AS nombre FROM objects o
-     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND ABS(s.Qtty) > 0.0005)${noOculto("o.ID")}
+     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND ABS(s.Qtty) > 0.0005)
      ORDER BY o.Name`
   );
 
@@ -871,6 +898,138 @@ export async function ipv(pool, ctx, q) {
 }
 
 // ---------- Sugerencias de traspaso almacén → punto de venta ----------
+
+/** Historia de mercancía de un producto (estilo AxisPOS). */
+export async function historialMercancia(pool, ctx, q) {
+  const id = parseInt(q.id || q.goodId, 10);
+  if (!Number.isInteger(id)) return { error: "Producto no indicado" };
+  const { desde, hasta } = ctx.r;
+  const local = parseInt(q.local, 10);
+  const tieneLocal = Number.isInteger(local);
+
+  const [prod] = await filas(
+    pool,
+    `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, g.PriceIn AS costo, ${PRECIO} AS precio,
+            COALESCE(gg.Name,'Sin grupo') AS familia
+     FROM goods g LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID WHERE g.ID = ?`,
+    [id]
+  );
+  if (!prod) return { error: "Producto no encontrado" };
+
+  // Stock actual total / por local
+  const stocks = await filas(
+    pool,
+    `SELECT s.ObjectID AS localId, COALESCE(ob.Name, CONCAT('Local ', s.ObjectID)) AS local, SUM(s.Qtty) AS qty
+     FROM store s LEFT JOIN objects ob ON ob.ID = s.ObjectID
+     WHERE s.GoodID = ? GROUP BY s.ObjectID, ob.Name`,
+    [id]
+  );
+  const stockTotal = stocks.reduce((a, x) => a + num(x.qty), 0);
+
+  let localSql = "";
+  const params = [id, desde, hasta];
+  if (tieneLocal) {
+    localSql = " AND EXISTS (SELECT 1 FROM shift sh WHERE sh.ID = o.ShiftID AND sh.ObjectID = ?)";
+    params.push(local);
+  }
+
+  const movs = await filas(
+    pool,
+    `SELECT o.ID AS id,
+            DATE_FORMAT(${F}, '%Y-%m-%d %H:%i') AS fecha,
+            o.OperType AS tipo,
+            o.Qtty AS cant,
+            o.PriceOut AS precio,
+            o.PriceIn AS costo,
+            ${IMP} AS importe,
+            o.Acct AS ticket,
+            o.Note AS nota,
+            COALESCE(u.Name, '') AS usuario,
+            COALESCE(ob.Name, '') AS local
+     FROM operations o
+     LEFT JOIN users u ON u.ID = o.UserID
+     LEFT JOIN shift sh ON sh.ID = o.ShiftID
+     LEFT JOIN objects ob ON ob.ID = sh.ObjectID
+     WHERE o.GoodID = ? AND ${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY)${localSql}
+     ORDER BY ${F} ASC, o.ID ASC
+     LIMIT 2000`,
+    params
+  );
+
+  // Nombres de tipos habituales AxisPOS
+  const NOM = {
+    1: "Compra / entrada",
+    2: "Venta",
+    3: "Merma / baja",
+    7: "Transferencia salida",
+    8: "Transferencia entrada",
+    11: "Ajuste",
+    12: "Producción",
+    16: "Stock-taking / conteo",
+    34: "Devolución",
+  };
+
+  // Reconstruir existencia corrida hacia el final conocido
+  // final actual; restamos movimientos posteriores al 'hasta' no están; dentro del rango:
+  // empezamos desde stock actual, restamos neto de TODOS los movs desde 'desde' hasta ahora fuera del listado es complejo.
+  // Enfoque práctico: existencia final = stock actual; ir hacia atrás desde el último movimiento del rango.
+  let corrida = stockTotal;
+  // movimientos posteriores a 'hasta' no están en la lista; stock actual incluye todo.
+  // Para el listado: calculamos hacia atrás desde el final del periodo ≈ stock actual si hasta=hoy.
+  const detalle = [];
+  // Primero neto del periodo
+  const neto = movs.reduce((a, m) => a + num(m.cant), 0);
+  // inicio periodo ≈ final - neto (si no hubo mov fuera y stock actual es final)
+  let saldo = redondear(stockTotal - 0, 3); // asumimos hasta ≈ hoy
+  // Ajuste: si el periodo no llega a hoy, no es exacto; documentamos.
+
+  // Rehacer: ir de más antiguo a más reciente partiendo de inicio = final - suma(cant en periodo)
+  let inicio = redondear(stockTotal - neto, 3);
+  let running = inicio;
+  for (const m of movs) {
+    const cant = num(m.cant);
+    const entrada = cant > 0 ? cant : 0;
+    const salida = cant < 0 ? Math.abs(cant) : 0;
+    running = redondear(running + cant, 3);
+    detalle.push({
+      id: m.id,
+      fecha: m.fecha,
+      tipo: m.tipo,
+      operacion: NOM[m.tipo] || `Tipo ${m.tipo}`,
+      entrada: entrada || null,
+      salida: salida || null,
+      cant,
+      importe: num(m.importe),
+      costo: num(m.costo),
+      precio: num(m.precio),
+      final: running,
+      ticket: m.ticket,
+      usuario: m.usuario,
+      local: m.local,
+      nota: m.nota || "",
+    });
+  }
+
+  return {
+    producto: {
+      id: prod.id,
+      codigo: prod.codigo,
+      nombre: prod.nombre,
+      familia: prod.familia,
+      costo: num(prod.costo),
+      precio: num(prod.precio),
+    },
+    stockTotal: redondear(stockTotal, 3),
+    stocks,
+    desde,
+    hasta,
+    inicio: redondear(inicio, 3),
+    final: redondear(running, 3),
+    movimientos: detalle.length,
+    filas: detalle,
+  };
+}
+
 export async function traspasos(pool, ctx, q) {
   const aj = ctx.aj;
   const { desde, hasta } = ctx.r;
@@ -896,7 +1055,7 @@ export async function traspasos(pool, ctx, q) {
     ventasPorLocal = await filas(
       pool,
       `SELECT o.ID AS lid, o.Name AS local, 0 AS tickets, 0 AS total FROM objects o
-       WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0)${noOculto("o.ID")} ORDER BY o.Name`
+       WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0) ORDER BY o.Name`
     );
   }
 
@@ -910,7 +1069,7 @@ export async function traspasos(pool, ctx, q) {
      JOIN objects o ON o.ID = s.ObjectID
      JOIN goods g ON g.ID = s.GoodID
      LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-     WHERE COALESCE(g.Deleted,0) = 0${noOculto("s.ObjectID")}
+     WHERE COALESCE(g.Deleted,0) = 0
      GROUP BY s.ObjectID, o.Name, s.GoodID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.MinQtty
      HAVING SUM(s.Qtty) > 0.0005`
   );
@@ -1068,105 +1227,258 @@ export async function traspasos(pool, ctx, q) {
 }
 
 // ---------- Caja y cierres ----------
+/**
+ * Cuadre alineado con AxisPOS:
+ * - DiffClose oficial de Axis
+ * - Esperado = TotalOpen + libro de caja del turno − TotalWithdrawal
+ * - PriceOut ya incluye descuento; no se vuelve a restar
+ * - Solo ventas finalizadas (Sign < 0)
+ */
 export async function caja(pool, ctx, q) {
   const { desde, hasta } = ctx.r;
-  const tol = ctx.aj.tolCierre;
+  const tol = num(ctx.aj?.tolCierre) || 500;
   const pagina = Math.max(parseInt(q.pagina, 10) || 1, 1);
   const filtroU = ctx.uid != null ? " AND sh.UserID = ?" : "";
   const params = ctx.uid != null ? [desde, hasta, ctx.uid] : [desde, hasta];
+
   const todos = await filas(
     pool,
-    `SELECT sh.ID AS id, o.Name AS local, u.Name AS usuario, DATE_FORMAT(sh.DateTimeOpen,'%Y-%m-%d %H:%i:%s') AS apertura,
-            DATE_FORMAT(sh.DateTimeClose,'%Y-%m-%d %H:%i:%s') AS cierre, sh.TotalOpen AS inicial, sh.TotalFinal AS contado,
-            sh.TotalWithdrawal AS retiro, sh.DiffClose AS difAxis, COALESCE(v.total,0) AS ventas, COALESCE(v.tickets,0) AS tickets,
-            COALESCE(d.total,0) AS devoluciones, COALESCE(pg.total,0) AS pagos
-     FROM shift sh LEFT JOIN objects o ON o.ID = sh.ObjectID LEFT JOIN users u ON u.ID = sh.UserID
-     LEFT JOIN (SELECT o.ShiftID, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} GROUP BY o.ShiftID) v ON v.ShiftID = sh.ID
-     LEFT JOIN (SELECT o.ShiftID, SUM(${IMP}) AS total FROM operations o WHERE ${DEVOL} GROUP BY o.ShiftID) d ON d.ShiftID = sh.ID
-     LEFT JOIN (SELECT ShiftID, SUM(Qtty) AS total FROM payments WHERE OperType = 2 AND Mode = 1 GROUP BY ShiftID) pg ON pg.ShiftID = sh.ID
-     WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)${filtroU} ORDER BY sh.DateTimeOpen DESC`,
+    `SELECT sh.ID AS id, o.Name AS local, u.Name AS usuario,
+            DATE_FORMAT(sh.DateTimeOpen,'%Y-%m-%d %H:%i:%s') AS apertura,
+            DATE_FORMAT(sh.DateTimeClose,'%Y-%m-%d %H:%i:%s') AS cierre,
+            sh.TotalOpen AS inicial, sh.TotalFinal AS contado,
+            sh.TotalWithdrawal AS retiro, sh.DiffClose AS difAxis,
+            COALESCE(v.total,0) AS ventas, COALESCE(v.tickets,0) AS tickets,
+            COALESCE(d.total,0) AS devoluciones,
+            COALESCE(cb.neto,0) AS libroCaja,
+            COALESCE(cb.entradas,0) AS libroEntradas,
+            COALESCE(cb.salidas,0) AS libroSalidas,
+            COALESCE(pg.efectivo,0) AS pagosEfectivo,
+            COALESCE(pg.tarjeta,0) AS pagosTarjeta,
+            COALESCE(pg.transfer,0) AS pagosTransfer,
+            COALESCE(pg.otros,0) AS pagosOtros,
+            COALESCE(pg.todos,0) AS pagosTodos
+     FROM shift sh
+     LEFT JOIN objects o ON o.ID = sh.ObjectID
+     LEFT JOIN users u ON u.ID = sh.UserID
+     LEFT JOIN (
+       SELECT o.ShiftID, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS tickets
+       FROM operations o WHERE ${VENTA} GROUP BY o.ShiftID
+     ) v ON v.ShiftID = sh.ID
+     LEFT JOIN (
+       SELECT o.ShiftID, SUM(${IMP}) AS total
+       FROM operations o WHERE ${DEVOL} GROUP BY o.ShiftID
+     ) d ON d.ShiftID = sh.ID
+     LEFT JOIN (
+       SELECT ShiftID,
+              SUM(CASE WHEN COALESCE(Sign,0) >= 0 THEN COALESCE(Profit,0) ELSE 0 END) AS entradas,
+              SUM(CASE WHEN COALESCE(Sign,0) < 0 THEN COALESCE(Profit,0) ELSE 0 END) AS salidas,
+              SUM(COALESCE(Sign,0) * COALESCE(Profit,0)) AS neto
+       FROM cashbook
+       GROUP BY ShiftID
+     ) cb ON cb.ShiftID = sh.ID
+     LEFT JOIN (
+       SELECT ShiftID,
+              SUM(CASE WHEN Mode = 1 THEN Qtty ELSE 0 END) AS efectivo,
+              SUM(CASE WHEN Mode = 2 THEN Qtty ELSE 0 END) AS tarjeta,
+              SUM(CASE WHEN Mode = 3 THEN Qtty ELSE 0 END) AS transfer,
+              SUM(CASE WHEN Mode NOT IN (1,2,3) THEN Qtty ELSE 0 END) AS otros,
+              SUM(Qtty) AS todos
+       FROM payments WHERE OperType = 2
+       GROUP BY ShiftID
+     ) pg ON pg.ShiftID = sh.ID
+     WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)${filtroU}
+     ORDER BY sh.DateTimeOpen DESC`,
     params
-  );
-  // Desglose de cobros por turno y forma de pago (Mode típico AxisPOS: 1 efectivo, otros tarjeta/transfer)
-  const pagosModo = await filas(
-    pool,
-    `SELECT p.ShiftID AS sid, p.Mode AS modo, SUM(p.Qtty) AS total, COUNT(*) AS n
-     FROM payments p
-     JOIN shift sh ON sh.ID = p.ShiftID
-     WHERE p.OperType = 2 AND sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)
-     GROUP BY p.ShiftID, p.Mode`,
-    [desde, hasta]
-  ).catch(() => []);
-  const pagosPorTurno = new Map();
-  for (const x of pagosModo) {
-    const sid = num(x.sid);
-    if (!pagosPorTurno.has(sid)) pagosPorTurno.set(sid, []);
-    const modo = num(x.modo);
-    const nombre = modo === 1 ? "Efectivo" : modo === 2 ? "Tarjeta" : modo === 3 ? "Transferencia" : `Modo ${modo}`;
-    pagosPorTurno.get(sid).push({ modo, nombre, total: num(x.total), n: num(x.n) });
-  }
+  ).catch(async (err) => {
+    // Si cashbook no existe, degradar sin libro
+    console.error("caja query", err.message);
+    return filas(
+      pool,
+      `SELECT sh.ID AS id, o.Name AS local, u.Name AS usuario,
+              DATE_FORMAT(sh.DateTimeOpen,'%Y-%m-%d %H:%i:%s') AS apertura,
+              DATE_FORMAT(sh.DateTimeClose,'%Y-%m-%d %H:%i:%s') AS cierre,
+              sh.TotalOpen AS inicial, sh.TotalFinal AS contado,
+              sh.TotalWithdrawal AS retiro, sh.DiffClose AS difAxis,
+              COALESCE(v.total,0) AS ventas, COALESCE(v.tickets,0) AS tickets,
+              COALESCE(d.total,0) AS devoluciones,
+              0 AS libroCaja, 0 AS libroEntradas, 0 AS libroSalidas,
+              COALESCE(pg.efectivo,0) AS pagosEfectivo,
+              COALESCE(pg.tarjeta,0) AS pagosTarjeta,
+              COALESCE(pg.transfer,0) AS pagosTransfer,
+              COALESCE(pg.otros,0) AS pagosOtros,
+              COALESCE(pg.todos,0) AS pagosTodos
+       FROM shift sh
+       LEFT JOIN objects o ON o.ID = sh.ObjectID
+       LEFT JOIN users u ON u.ID = sh.UserID
+       LEFT JOIN (
+         SELECT o.ShiftID, SUM(${IMP}) AS total, COUNT(DISTINCT o.Acct) AS tickets
+         FROM operations o WHERE ${VENTA} GROUP BY o.ShiftID
+       ) v ON v.ShiftID = sh.ID
+       LEFT JOIN (
+         SELECT o.ShiftID, SUM(${IMP}) AS total FROM operations o WHERE ${DEVOL} GROUP BY o.ShiftID
+       ) d ON d.ShiftID = sh.ID
+       LEFT JOIN (
+         SELECT ShiftID,
+                SUM(CASE WHEN Mode = 1 THEN Qtty ELSE 0 END) AS efectivo,
+                SUM(CASE WHEN Mode = 2 THEN Qtty ELSE 0 END) AS tarjeta,
+                SUM(CASE WHEN Mode = 3 THEN Qtty ELSE 0 END) AS transfer,
+                SUM(CASE WHEN Mode NOT IN (1,2,3) THEN Qtty ELSE 0 END) AS otros,
+                SUM(Qtty) AS todos
+         FROM payments WHERE OperType = 2 GROUP BY ShiftID
+       ) pg ON pg.ShiftID = sh.ID
+       WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)${filtroU}
+       ORDER BY sh.DateTimeOpen DESC`,
+      params
+    );
+  });
+
   const turnos = todos.map((t) => {
-    const ventas = num(t.ventas), dev = num(t.devoluciones), contado = num(t.contado);
-    const esperado = num(t.inicial) + ventas - dev - num(t.retiro);
-    const cerrado = !!t.cierre && contado > 0;
-    const dif = cerrado ? redondear(contado - esperado) : null;
-    const difPagos = redondear(ventas - num(t.pagos));
-    const nivel = dif == null ? null : Math.abs(dif) > tol * 10 ? "alta" : Math.abs(dif) > tol ? "media" : "ok";
-    const cobros = pagosPorTurno.get(num(t.id)) || [];
-    const cobrosMap = Object.fromEntries(cobros.map((c) => [c.nombre, c.total]));
+    const ventas = num(t.ventas);
+    const dev = num(t.devoluciones);
+    const contado = num(t.contado);
+    const inicial = num(t.inicial);
+    const retiro = num(t.retiro);
+    const libro = num(t.libroCaja);
+    // En Axis: neto libro ≈ SUM(Sign * Profit); Sign +1 entrada, -1 salida
+    // Esperado efectivo = fondo + movimientos de libro - retirada
+    const esperado = redondear(inicial + libro - retiro);
+    const difAxis = t.difAxis == null ? null : num(t.difAxis);
+    const cerrado = !!(t.cierre && String(t.cierre) !== "0000-00-00 00:00:00");
+    // Axis DiffClose = esperado − contado
+    const difCalc = cerrado ? redondear(esperado - contado) : null;
+    const diferencia = difAxis != null ? redondear(difAxis) : difCalc;
+    const sinContar = cerrado && contado === 0 && Math.abs(esperado) > 1;
+    const pagosTodos = num(t.pagosTodos);
+    const difPagos = redondear(pagosTodos - (ventas - dev));
+
+    let nivel = "ok";
+    if (sinContar) nivel = "media";
+    else if (diferencia != null && Math.abs(diferencia) > tol)
+      nivel = Math.abs(diferencia) > tol * 3 ? "alta" : "media";
+
     return {
-      id: t.id, local: t.local, usuario: t.usuario, apertura: t.apertura, cierre: t.cierre, tickets: num(t.tickets),
-      ventas, devoluciones: dev, retiro: num(t.retiro), inicial: num(t.inicial), esperado: redondear(esperado), contado,
-      diferencia: dif, nivel, difAxis: num(t.difAxis), pagos: num(t.pagos), difPagos, sinCierre: !cerrado && !!t.cierre,
-      cobros,
-      efectivo: cobrosMap.Efectivo || 0,
-      tarjeta: cobrosMap.Tarjeta || 0,
-      transferencia: cobrosMap.Transferencia || 0,
-      horasTurno: t.cierre && t.apertura ? redondear((new Date(t.cierre.replace(" ", "T")) - new Date(t.apertura.replace(" ", "T"))) / 3600000, 2) : null,
+      id: t.id,
+      local: t.local,
+      usuario: t.usuario,
+      apertura: t.apertura,
+      cierre: t.cierre,
+      tickets: num(t.tickets),
+      ventas,
+      devoluciones: dev,
+      retiro,
+      inicial,
+      libroCaja: redondear(libro),
+      libroEntradas: redondear(num(t.libroEntradas)),
+      libroSalidas: redondear(num(t.libroSalidas)),
+      esperado,
+      contado,
+      diferencia,
+      difAxis,
+      difCalc,
+      nivel,
+      sinContar,
+      estadoCierre: !cerrado ? "Abierto" : sinContar ? "Cerrado sin contar" : "Cerrado",
+      pagosEfectivo: num(t.pagosEfectivo),
+      pagosTarjeta: num(t.pagosTarjeta),
+      pagosTransfer: num(t.pagosTransfer),
+      pagosOtros: num(t.pagosOtros),
+      pagos: pagosTodos,
+      difPagos,
+      formasPago: [
+        { modo: 1, nombre: "Efectivo", total: num(t.pagosEfectivo) },
+        { modo: 2, nombre: "Tarjeta", total: num(t.pagosTarjeta) },
+        { modo: 3, nombre: "Transferencia", total: num(t.pagosTransfer) },
+        { modo: 0, nombre: "Otros", total: num(t.pagosOtros) },
+      ].filter((x) => Math.abs(x.total) > 0.001),
+      sinCierre: !cerrado,
+      horasTurno:
+        t.cierre && t.apertura
+          ? redondear(
+              (new Date(String(t.cierre).replace(" ", "T")) -
+                new Date(String(t.apertura).replace(" ", "T"))) /
+                3600000,
+              2
+            )
+          : null,
+      metodo: difAxis != null ? "DiffClose AxisPOS" : "libro de caja",
     };
   });
-  const [[dv], formas] = await Promise.all([
-    pool.query(`SELECT COALESCE(SUM(${IMP}),0) AS total FROM operations o WHERE ${DEVOL} AND ${RANGO}${uid(ctx)}`, parRango(ctx, desde, hasta)),
-    filas(pool, `SELECT COALESCE(p.Company,'Sin socio') AS socio, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total
-      FROM operations o LEFT JOIN partners p ON p.ID = o.PartnerID WHERE ${VENTA} AND ${RANGO}${uid(ctx)} GROUP BY p.ID, p.Company ORDER BY total DESC`, parRango(ctx, desde, hasta)),
-  ]);
+
   const ventasTot = turnos.reduce((s, t) => s + t.ventas, 0);
   const conDif = turnos.filter((t) => t.nivel === "media" || t.nivel === "alta");
   const paginas = Math.max(Math.ceil(turnos.length / 20), 1);
 
-  // Histórico de diferencias por cajero (faltantes / sobrantes) para auditoría
   const porCajeroMap = new Map();
   for (const t of turnos) {
     if (t.diferencia == null) continue;
     const k = t.usuario || "Sin nombre";
-    if (!porCajeroMap.has(k)) porCajeroMap.set(k, { usuario: k, turnos: 0, conDif: 0, faltante: 0, sobrante: 0, totalDif: 0, maxFaltante: 0, maxSobrante: 0 });
+    if (!porCajeroMap.has(k))
+      porCajeroMap.set(k, {
+        usuario: k, turnos: 0, conDif: 0, faltante: 0, sobrante: 0,
+        totalDif: 0, maxFaltante: 0, maxSobrante: 0, sinContar: 0,
+      });
     const c = porCajeroMap.get(k);
     c.turnos += 1;
     c.totalDif += t.diferencia;
-    if (t.diferencia < 0) {
+    if (t.sinContar) c.sinContar += 1;
+    // DiffClose = esperado − contado → positivo = faltante (contó de menos)
+    if (t.diferencia > 0.009) {
       c.faltante += t.diferencia;
-      c.maxFaltante = Math.min(c.maxFaltante, t.diferencia);
-      c.conDif += 1;
-    } else if (t.diferencia > 0) {
-      c.sobrante += t.diferencia;
-      c.maxSobrante = Math.max(c.maxSobrante, t.diferencia);
-      c.conDif += 1;
+      c.maxFaltante = Math.max(c.maxFaltante, t.diferencia);
+      if (Math.abs(t.diferencia) > tol) c.conDif += 1;
+    } else if (t.diferencia < -0.009) {
+      c.sobrante += -t.diferencia;
+      c.maxSobrante = Math.max(c.maxSobrante, -t.diferencia);
+      if (Math.abs(t.diferencia) > tol) c.conDif += 1;
     }
   }
   const porCajero = [...porCajeroMap.values()]
-    .map((c) => ({ ...c, faltante: redondear(c.faltante), sobrante: redondear(c.sobrante), totalDif: redondear(c.totalDif), maxFaltante: redondear(c.maxFaltante), maxSobrante: redondear(c.maxSobrante) }))
+    .map((c) => ({
+      ...c,
+      faltante: redondear(c.faltante),
+      sobrante: redondear(c.sobrante),
+      totalDif: redondear(c.totalDif),
+      maxFaltante: redondear(c.maxFaltante),
+      maxSobrante: redondear(c.maxSobrante),
+    }))
     .sort((a, b) => Math.abs(b.totalDif) - Math.abs(a.totalDif));
 
+  const formas = await filas(
+    pool,
+    `SELECT COALESCE(p.Company,'Sin socio') AS socio, COUNT(DISTINCT o.Acct) AS tickets, SUM(${IMP}) AS total
+     FROM operations o LEFT JOIN partners p ON p.ID = o.PartnerID
+     WHERE ${VENTA} AND ${RANGO}${uid(ctx)} GROUP BY p.ID, p.Company ORDER BY total DESC`,
+    parRango(ctx, desde, hasta)
+  ).catch(() => []);
+
+  const dv = await filas(
+    pool,
+    `SELECT COALESCE(SUM(${IMP}),0) AS total FROM operations o WHERE ${DEVOL} AND ${RANGO}${uid(ctx)}`,
+    parRango(ctx, desde, hasta)
+  ).catch(() => [{ total: 0 }]);
+
   return {
-    ventas: ventasTot, devoluciones: num(dv[0].total), neto: ventasTot - num(dv[0].total), turnos: turnos.length,
-    conDiferencia: conDif.length, faltante: redondear(conDif.filter((t) => t.diferencia < 0).reduce((s, t) => s + t.diferencia, 0)),
-    sobrante: redondear(conDif.filter((t) => t.diferencia > 0).reduce((s, t) => s + t.diferencia, 0)),
-    sinCuadrar: turnos.filter((t) => Math.abs(t.difPagos) > 1 && t.ventas > 0).length, tolerancia: tol,
+    ventas: ventasTot,
+    devoluciones: num(dv[0]?.total),
+    neto: ventasTot - num(dv[0]?.total),
+    turnos: turnos.length,
+    conDiferencia: conDif.length,
+    cerradosSinContar: turnos.filter((t) => t.sinContar).length,
+    faltante: redondear(conDif.filter((t) => t.diferencia > 0).reduce((s, t) => s + t.diferencia, 0)),
+    sobrante: redondear(conDif.filter((t) => t.diferencia < 0).reduce((s, t) => s + Math.abs(t.diferencia), 0)),
+    sinCuadrar: turnos.filter((t) => Math.abs(t.difPagos) > 1 && t.ventas > 0).length,
+    tolerancia: tol,
+    nota:
+      "Esperado = fondo + libro de caja − retiro. Diferencia = DiffClose de Axis (esperado − contado). PriceOut ya incluye descuento.",
     formasPago: formas.map((x) => ({ socio: x.socio, tickets: num(x.tickets), total: num(x.total) })),
     porCajero,
-    pagina, paginas, filas: q.todo ? turnos : turnos.slice((pagina - 1) * 20, pagina * 20),
+    pagina,
+    paginas,
+    filas: q.todo ? turnos : turnos.slice((pagina - 1) * 20, pagina * 20),
   };
 }
+
 
 // ---------- Equipo ----------
 export async function equipo(pool, ctx) {
@@ -1364,10 +1676,13 @@ export async function eventos(pool, ctx, q) {
   const filtros = {
     cancel: "l.Message LIKE '%operación cancelada%'",
     anular: "l.Message LIKE 'Anular venta%' OR l.Message LIKE '%anul%' OR l.Message LIKE '%Anular%'",
-    elim: "l.Message LIKE '%se eliminó%'",
-    desc: "l.Message LIKE '%cambiado el descuento%'",
-    login: "l.Message LIKE 'Inicio fallido%'",
-    cajon: "l.Message LIKE '%cajón de moneda%'",
+    elim: "l.Message LIKE '%se eliminó%' OR l.Message LIKE '%eliminó la mercanc%'",
+    desc: "l.Message LIKE '%descuento%' OR l.Message LIKE '%Discount%'",
+    precio: "l.Message LIKE '%precio de venta%' OR l.Message LIKE '%modificado la mercanc%' OR l.Message LIKE '%antiguo precio%'",
+    login: "l.Message LIKE 'Inicio fallido%' OR l.Message LIKE '%Inicio fallido%'",
+    cajon: "l.Message LIKE '%cajón de moneda%' OR l.Message LIKE '%cajon%'",
+    cierre: "l.Message LIKE '%auditoría de caja%' OR l.Message LIKE '%auditoria de caja%'",
+    todo: "1=1",
   };
   const cond = filtros[q.tipo] || filtros.cancel;
   const params = [desde, hasta];
@@ -1574,6 +1889,42 @@ export async function auditoria(pool, ctx) {
     })
     .sort((a, b) => b.riesgo - a.riesgo);
 
+  // Detalle de logs: precios, anulaciones, cancelaciones, devoluciones
+  const [cambiosPrecio, anulacionesLog, cancelacionesLog, devolucionesOps] = await Promise.all([
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE '%precio de venta%' OR l.Message LIKE '%antiguo precio%' OR l.Message LIKE '%modificado la mercanc%')
+       ORDER BY l.UserRealTime DESC LIMIT 60`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND (l.Message LIKE 'Anular venta%' OR l.Message LIKE '%Anular venta%' OR l.Message LIKE '%anulada%')
+       ORDER BY l.UserRealTime DESC LIMIT 60`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT DATE_FORMAT(l.UserRealTime,'%Y-%m-%d %H:%i') AS fecha, u.Name AS usuario, l.Message AS mensaje
+       FROM applicationlog l LEFT JOIN users u ON u.ID = l.UserID
+       WHERE ${LOGF} AND l.Message LIKE '%operación cancelada%'
+       ORDER BY l.UserRealTime DESC LIMIT 60`,
+      P
+    ).catch(() => []),
+    filas(
+      pool,
+      `SELECT o.Acct AS acct, MAX(${F}) AS fecha, SUM(${IMP}) AS total, MAX(u.Name) AS cajero, COUNT(*) AS lineas
+       FROM operations o LEFT JOIN users u ON u.ID = o.UserID
+       WHERE ${DEVOL} AND ${RANGO}
+       GROUP BY o.Acct ORDER BY fecha DESC LIMIT 40`,
+      P
+    ).catch(() => []),
+  ]);
+
   const hallazgos = [];
   if (anom.totales.alta > 0)
     hallazgos.push({
@@ -1650,11 +2001,28 @@ export async function auditoria(pool, ctx) {
       cajero: x.cajero || "",
     })),
     fueraHorario: porHoraNoche.map((x) => ({ hora: num(x.hora), tickets: num(x.tickets), total: num(x.total) })),
-    cancelacionesPorDia: cancelDia.map((x) => ({ dia: x.dia, n: num(x.n) })),
+        cancelacionesPorDia: cancelDia.map((x) => ({ dia: x.dia, n: num(x.n) })),
     topCanceladores: topCanceladores.map((x) => ({ id: num(x.id), nombre: x.nombre || "—", n: num(x.n) })),
     ventas: { total: num(resumenVentas.total), tickets: num(resumenVentas.tickets) },
+    cambiosPrecio: cambiosPrecio.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+    anulaciones: anulacionesLog.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+    cancelaciones: cancelacionesLog.map((x) => ({ fecha: x.fecha, usuario: x.usuario || "—", mensaje: x.mensaje })),
+    devolucionesDetalle: devolucionesOps.map((x) => ({
+      acct: num(x.acct), ticket: numTicket(x.acct), fecha: x.fecha, total: num(x.total),
+      cajero: x.cajero || "", lineas: num(x.lineas),
+    })),
+    contadores: {
+      cambiosPrecio: cambiosPrecio.length,
+      anulaciones: anulacionesLog.length,
+      cancelaciones: cancelacionesLog.length,
+      devoluciones: devolucionesOps.length,
+      descuentosAltos: descAltos.length,
+      turnosConDif: cajaData.conDiferencia || 0,
+    },
     umbrales: { descMax: aj.descMax, umbralCancel: aj.umbralCancel, tolCierre: aj.tolCierre },
+    notaCaja: cajaData.nota || "Descuadre basado en DiffClose de AxisPOS (solo efectivo).",
   };
+
 }
 
 // ---------- Usuarios de AxisPOS (para PIN y roles) ----------
@@ -1732,7 +2100,7 @@ export async function antiguedadStock(pool, ctx) {
     `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(gg.Name,'Sin grupo') AS familia,
             SUM(s.Qtty) AS stock, g.PriceIn AS costo, ${PRECIO} AS precio
      FROM store s JOIN goods g ON g.ID = s.GoodID LEFT JOIN goodsgroups gg ON gg.ID = g.GroupID
-     WHERE COALESCE(g.Deleted,0)=0${noOculto("s.ObjectID")} GROUP BY g.ID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
+     WHERE COALESCE(g.Deleted,0)=0 GROUP BY g.ID, g.Code, g.Name, gg.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3
      HAVING SUM(s.Qtty) > 0.0005`
   );
   const buckets = { d0_30: [], d31_60: [], d61_90: [], d90: [], nunca: [] };
@@ -1773,38 +2141,198 @@ export async function antiguedadStock(pool, ctx) {
   };
 }
 
-export async function traspasosHechos(pool, ctx) {
+export async function traspasosHechos(pool, ctx, q = {}) {
   const { desde, hasta } = ctx.r;
-  // OperTypes de transferencia típicos Microinvest: 7, 26, 27
-  const lista = await filas(
-    pool,
-    `SELECT ${F} AS fecha, o.OperType AS tipo, g.Name AS nombre, g.Code AS codigo,
-            ABS(o.Qtty) AS cant, u.Name AS usuario, o.Note AS nota, o.Acct AS acct,
-            COALESCE(obj.Name,'') AS local
-     FROM operations o
-     LEFT JOIN goods g ON g.ID = o.GoodID
-     LEFT JOIN users u ON u.ID = o.UserID
-     LEFT JOIN shift sh ON sh.ID = o.ShiftID
-     LEFT JOIN objects obj ON obj.ID = sh.ObjectID
-     WHERE o.OperType IN (7, 26, 27) AND ${RANGO}
-     ORDER BY fecha DESC LIMIT 500`,
-    [desde, hasta]
-  ).catch(() => []);
-  const porProd = {};
-  let unidades = 0;
-  for (const x of lista) {
-    unidades += num(x.cant);
-    const k = x.nombre || "?";
-    if (!porProd[k]) porProd[k] = { nombre: k, cant: 0, n: 0 };
-    porProd[k].cant += num(x.cant); porProd[k].n++;
+  const pct = ctx.aj?.costoEstimadoPct ?? 10;
+  const busca = String(q.q || "").trim().slice(0, 60);
+  const origenId = parseInt(q.origen, 10);
+  const destId = parseInt(q.destino, 10);
+  const tieneOrigen = Number.isInteger(origenId);
+  const tieneDest = Number.isInteger(destId);
+
+  // Tipos de transferencia habituales en Axis / Microinvest
+  const TIPOS = [7, 8, 26, 27];
+  const NOM = {
+    7: "Transferencia salida",
+    8: "Transferencia entrada",
+    26: "Traspaso",
+    27: "Traspaso (alt)",
+  };
+
+  let lista = [];
+  // Intento 1: ObjectID en operations (algunas instalaciones)
+  try {
+    lista = await filas(
+      pool,
+      `SELECT o.ID AS id, ${F} AS fecha, o.OperType AS tipo, o.Qtty AS cant, o.Acct AS acct,
+              o.PriceIn AS costo, o.PriceOut AS precio, o.Note AS nota,
+              g.ID AS gid, g.Code AS codigo, g.Name AS nombre, g.PriceIn AS costoFicha, ${PRECIO} AS precioFicha,
+              u.Name AS usuario,
+              o.ObjectID AS objectId,
+              COALESCE(obj.Name, CONCAT('Local ', o.ObjectID)) AS local
+       FROM operations o
+       LEFT JOIN goods g ON g.ID = o.GoodID
+       LEFT JOIN users u ON u.ID = o.UserID
+       LEFT JOIN objects obj ON obj.ID = o.ObjectID
+       WHERE o.OperType IN (7, 8, 26, 27) AND ${RANGO}
+       ORDER BY fecha DESC, o.Acct, o.ID
+       LIMIT 4000`,
+      [desde, hasta]
+    );
+  } catch {
+    lista = [];
   }
+  // Intento 2: local vía turno
+  if (!lista.length) {
+    lista = await filas(
+      pool,
+      `SELECT o.ID AS id, ${F} AS fecha, o.OperType AS tipo, o.Qtty AS cant, o.Acct AS acct,
+              o.PriceIn AS costo, o.PriceOut AS precio, o.Note AS nota,
+              g.ID AS gid, g.Code AS codigo, g.Name AS nombre, g.PriceIn AS costoFicha, ${PRECIO} AS precioFicha,
+              u.Name AS usuario,
+              sh.ObjectID AS objectId,
+              COALESCE(obj.Name, '') AS local
+       FROM operations o
+       LEFT JOIN goods g ON g.ID = o.GoodID
+       LEFT JOIN users u ON u.ID = o.UserID
+       LEFT JOIN shift sh ON sh.ID = o.ShiftID
+       LEFT JOIN objects obj ON obj.ID = sh.ObjectID
+       WHERE o.OperType IN (7, 8, 26, 27) AND ${RANGO}
+       ORDER BY fecha DESC, o.Acct, o.ID
+       LIMIT 4000`,
+      [desde, hasta]
+    ).catch(() => []);
+  }
+
+  // Emparejar por documento (Acct): salidas (cant<0 o tipo 7) + entradas (cant>0 o tipo 8)
+  const porDoc = new Map();
+  for (const x of lista) {
+    const key = String(x.acct ?? x.id);
+    if (!porDoc.has(key)) porDoc.set(key, []);
+    porDoc.get(key).push(x);
+  }
+
+  const filasOut = [];
+  const rutas = new Map(); // "Desde→Hasta" agregados
+  let unidades = 0;
+  let valorCosto = 0;
+
+  const pushFila = (row) => {
+    if (busca) {
+      const hay = `${row.nombre} ${row.codigo}`.toLowerCase().includes(busca.toLowerCase());
+      if (!hay) return;
+    }
+    if (tieneOrigen && num(row.origenId) !== origenId) return;
+    if (tieneDest && num(row.destinoId) !== destId) return;
+    filasOut.push(row);
+    unidades += Math.abs(row.cant);
+    valorCosto += row.valorCosto;
+    const rk = `${row.desde} → ${row.hasta}`;
+    if (!rutas.has(rk)) rutas.set(rk, { ruta: rk, desde: row.desde, hasta: row.hasta, n: 0, unidades: 0, valor: 0 });
+    const r = rutas.get(rk);
+    r.n += 1;
+    r.unidades += Math.abs(row.cant);
+    r.valor += row.valorCosto;
+  };
+
+  for (const [, items] of porDoc) {
+    const salidas = items.filter((x) => num(x.cant) < 0 || num(x.tipo) === 7);
+    const entradas = items.filter((x) => num(x.cant) > 0 || num(x.tipo) === 8);
+    // Emparejar por producto
+    const byGood = new Map();
+    for (const x of items) {
+      const gid = num(x.gid) || x.nombre;
+      if (!byGood.has(gid)) byGood.set(gid, { sal: [], ent: [] });
+      const g = byGood.get(gid);
+      if (num(x.cant) < 0 || num(x.tipo) === 7) g.sal.push(x);
+      else g.ent.push(x);
+    }
+    for (const [, g] of byGood) {
+      if (g.sal.length && g.ent.length) {
+        const s = g.sal[0];
+        const e = g.ent[0];
+        const cant = Math.max(Math.abs(num(s.cant)), Math.abs(num(e.cant)));
+        const costoU = costoDe(s.costo || e.costo || s.costoFicha, s.precioFicha || e.precioFicha, pct);
+        pushFila({
+          fecha: s.fecha || e.fecha,
+          acct: num(s.acct || e.acct),
+          tipo: num(s.tipo),
+          nombreTipo: "Traspaso",
+          codigo: s.codigo || e.codigo || "",
+          nombre: s.nombre || e.nombre || "—",
+          cant: redondear(cant, 3),
+          costoUnit: redondear(costoU, 4),
+          valorCosto: redondear(cant * costoU, 2),
+          desde: s.local || "Origen",
+          hasta: e.local || "Destino",
+          origenId: num(s.objectId),
+          destinoId: num(e.objectId),
+          usuario: s.usuario || e.usuario || "",
+          nota: (s.nota || e.nota || "").slice(0, 120),
+        });
+      } else {
+        // Sin par: mostrar línea suelta
+        for (const x of [...g.sal, ...g.ent]) {
+          const cant = Math.abs(num(x.cant));
+          const costoU = costoDe(x.costo || x.costoFicha, x.precioFicha, pct);
+          const esSal = num(x.cant) < 0 || num(x.tipo) === 7;
+          pushFila({
+            fecha: x.fecha,
+            acct: num(x.acct),
+            tipo: num(x.tipo),
+            nombreTipo: NOM[num(x.tipo)] || `Tipo ${x.tipo}`,
+            codigo: x.codigo || "",
+            nombre: x.nombre || "—",
+            cant: redondear(cant, 3),
+            costoUnit: redondear(costoU, 4),
+            valorCosto: redondear(cant * costoU, 2),
+            desde: esSal ? (x.local || "Origen") : "—",
+            hasta: !esSal ? (x.local || "Destino") : "—",
+            origenId: esSal ? num(x.objectId) : null,
+            destinoId: !esSal ? num(x.objectId) : null,
+            usuario: x.usuario || "",
+            nota: (x.nota || "").slice(0, 120),
+          });
+        }
+      }
+    }
+  }
+
+  filasOut.sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+
+  const locales = await filas(
+    pool,
+    `SELECT o.ID AS id, o.Name AS nombre FROM objects o
+     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID)
+     ORDER BY o.Name`
+  ).catch(() => []);
+
+  // Top productos movidos
+  const porProd = {};
+  for (const x of filasOut) {
+    const k = x.nombre;
+    if (!porProd[k]) porProd[k] = { nombre: k, codigo: x.codigo, cant: 0, valor: 0, n: 0 };
+    porProd[k].cant += x.cant;
+    porProd[k].valor += x.valorCosto;
+    porProd[k].n += 1;
+  }
+
   return {
-    desde, hasta, movimientos: lista.length, unidades: redondear(unidades, 2),
-    porProducto: Object.values(porProd).sort((a, b) => b.cant - a.cant).slice(0, 30),
-    filas: lista.map((x) => ({
-      fecha: x.fecha, tipo: num(x.tipo), nombreTipo: NOMBRE_OPER[num(x.tipo)] || `Tipo ${x.tipo}`,
-      nombre: x.nombre, codigo: x.codigo, cant: num(x.cant), usuario: x.usuario, nota: x.nota || "", local: x.local,
-    })),
+    desde,
+    hasta,
+    movimientos: filasOut.length,
+    unidades: redondear(unidades, 2),
+    valorCosto: redondear(valorCosto, 2),
+    rutas: [...rutas.values()]
+      .map((r) => ({ ...r, unidades: redondear(r.unidades, 2), valor: redondear(r.valor, 2) }))
+      .sort((a, b) => b.unidades - a.unidades),
+    porProducto: Object.values(porProd)
+      .map((x) => ({ ...x, cant: redondear(x.cant, 2), valor: redondear(x.valor, 2) }))
+      .sort((a, b) => b.cant - a.cant)
+      .slice(0, 40),
+    locales: locales.map((x) => ({ id: x.id, nombre: x.nombre })),
+    filtros: { q: busca, origen: tieneOrigen ? origenId : "", destino: tieneDest ? destId : "" },
+    filas: filasOut.slice(0, 800),
   };
 }
 
@@ -1838,7 +2366,7 @@ export async function inventarioFisico(pool, ctx, body) {
     pool,
     `SELECT g.ID AS id, g.Code AS codigo, g.Name AS nombre, COALESCE(SUM(s.Qtty),0) AS sistema,
             g.PriceIn AS costo, ${PRECIO} AS precio
-     FROM goods g LEFT JOIN store s ON s.GoodID = g.ID${noOculto("s.ObjectID")}
+     FROM goods g LEFT JOIN store s ON s.GoodID = g.ID
      WHERE COALESCE(g.Deleted,0)=0
      GROUP BY g.ID, g.Code, g.Name, g.PriceIn, g.PriceOut1, g.PriceOut2, g.PriceOut3`
   );
@@ -2185,7 +2713,7 @@ export async function listaArqueo(pool, ctx, q) {
      FROM store s
      JOIN goods g ON g.ID = s.GoodID
      LEFT JOIN objects o ON o.ID = s.ObjectID
-     WHERE COALESCE(g.Deleted,0)=0${noOculto("s.ObjectID")} ${lid ? "AND s.ObjectID = ?" : ""}
+     WHERE COALESCE(g.Deleted,0)=0 ${lid ? "AND s.ObjectID = ?" : ""}
      GROUP BY g.ID, g.Code, g.Name, g.PriceOut1, g.PriceOut2, g.PriceOut3, g.MinQtty, o.Name, s.ObjectID
      HAVING ABS(COALESCE(SUM(s.Qtty),0)) > 0.0005 OR 1=1
      ORDER BY g.Name
@@ -2352,19 +2880,4 @@ export async function busquedaGlobal(pool, ctx, q) {
     productos: productos.map((x) => ({ id: x.id, codigo: x.codigo, nombre: x.nombre, precio: num(x.precio) })),
     usuarios: usuarios.map((x) => ({ id: x.id, nombre: x.nombre })),
   };
-}
-
-
-/** Todos los almacenes con existencias registradas (para el selector de Ajustes). */
-export async function almacenesTodos(pool) {
-  const f = await filas(
-    pool,
-    `SELECT o.ID AS id, o.Name AS nombre, o.Deleted AS archivado,
-            (SELECT COUNT(DISTINCT s.GoodID) FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0.0005) AS productos,
-            (SELECT COALESCE(SUM(s.Qtty),0) FROM store s WHERE s.ObjectID = o.ID AND s.Qtty > 0.0005) AS piezas
-     FROM objects o
-     WHERE EXISTS (SELECT 1 FROM store s WHERE s.ObjectID = o.ID AND s.Qtty <> 0)
-     ORDER BY o.Name`
-  );
-  return f.map((x) => ({ id: num(x.id), nombre: x.nombre + (num(x.archivado) !== 0 ? " (archivado)" : ""), productos: num(x.productos), piezas: redondear(x.piezas, 1) }));
 }

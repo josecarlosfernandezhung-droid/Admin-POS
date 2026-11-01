@@ -37,7 +37,6 @@ export const AJUSTES_BASE = {
   horaAperturaMax: 10,
   horasTurnoMax: 12,
   metaDiaria: 0, // CUP; 0 = sin meta
-  almacenesOcultos: [], // ids de almacenes que NO se muestran en existencias/inventario
 };
 
 let cache = null;

@@ -239,7 +239,6 @@ async function verAjustes(res, p) {
   responder(res, 200, {
     db: { host: db.host, puerto: db.puerto, base: db.base, usuario: db.usuario, permisos: await Q.comprobarPermisos(p) },
     ajustes: cfg.ajustes,
-    almacenes: await Q.almacenesTodos(p).catch(() => []),
     usuarios: lista.map((u) => ({ id: u.id, nombre: u.nombre, grupo: u.grupo, nivel: u.nivel, rolDefecto: A.rolPorNivel(u.nivel), rol: A.rolDe(u.id, u.nivel), tienePin: !!cfg.usuarios[u.id]?.hash })),
   });
 }
@@ -266,11 +265,6 @@ async function ajustesPost(req, res, ruta, s, p) {
     if (era === "admin" && b.rol !== "admin" && cfg.usuarios[u.id]?.hash && adminsConPin(lista).length <= 1) return falla(res, 400, "Debe quedar al menos un administrador con PIN.");
     cfg.usuarios[u.id] = { ...(cfg.usuarios[u.id] || {}), rol: b.rol };
     A.cerrarSesionesDe(u.id);
-  } else if (ruta === "/api/ajustes/almacenes") {
-    const ids = Array.isArray(b.ocultos) ? b.ocultos.map(Number).filter((n) => Number.isInteger(n)) : null;
-    if (!ids) return falla(res, 400, "Datos no válidos.");
-    cfg.ajustes.almacenesOcultos = [...new Set(ids)];
-    Q.fijarAlmacenesOcultos(cfg.ajustes.almacenesOcultos);
   } else if (ruta === "/api/ajustes/params") {
     const lim = { tasa: [1, 100000], plazoRepos: [0, 120], seguridad: [0, 60], cobertura: [1, 365], ventanaVentas: [7, 365], umbralCancel: [1, 1e9], descMax: [1, 100], tolCierre: [0, 1e7], costoEstimadoPct: [0, 90] };
     for (const [k, [mn, mx]] of Object.entries(lim)) {
@@ -289,7 +283,7 @@ const MODULO = {
   resumen: "resumen", ventas: "ventas", ticket: "ventas", "ventas-dia": "ventas",
   productos: "productos", top: "productos", "prod-tx": "productos", "cambios-precio": "productos", margen: "productos", "efecto-precios": "productos",
   existencias: "existencias", caja: "caja", equipo: "equipo", productividad: "equipo", "duracion-turnos": "equipo", ranking: "equipo", "turnos-horario": "equipo",
-  alertas: "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", traspasos: "inventario",
+  alertas: "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", "historial-mercancia": "inventario", traspasos: "inventario",
   antiguedad: "inventario", "traspasos-hechos": "inventario", fisico: "inventario", "lista-arqueo": "inventario",
   anomalias: "perdidas", eventos: "perdidas", mermas: "perdidas", auditoria: "perdidas",
   devoluciones: "perdidas", "patrones-anulacion": "perdidas",
@@ -299,7 +293,6 @@ const MODULO = {
 async function consulta(res, nombre, s, p, q) {
   if (!A.PERMISOS[s.rol].includes(MODULO[nombre] || "conteos") && nombre !== "conteos") return falla(res, 403, "Tu rol no tiene acceso a esta sección.");
   const aj = A.leer().ajustes;
-  Q.fijarAlmacenesOcultos(aj.almacenesOcultos);
   const r = await Q.resolverRango(p, q.periodo, q);
   const ctx = { r, uid: s.rol === "cajero" ? s.id : null, rol: s.rol, aj, rolDe: A.rolDe };
   let datos;
@@ -319,6 +312,7 @@ async function consulta(res, nombre, s, p, q) {
     case "abc": datos = await Q.analisisABC(p, ctx, q); break;
     case "compras": datos = await Q.sugerenciasCompra(p, ctx); break;
     case "ipv": datos = await Q.ipv(p, ctx, q); break;
+    case "historial-mercancia": datos = await Q.historialMercancia(p, ctx, q); break;
     case "traspasos": datos = await Q.traspasos(p, ctx, q); break;
     case "anomalias": datos = await Q.anomalias(p, ctx); break;
     case "eventos": datos = await Q.eventos(p, ctx, q); break;
@@ -326,7 +320,7 @@ async function consulta(res, nombre, s, p, q) {
     case "auditoria": datos = await Q.auditoria(p, ctx); break;
     case "devoluciones": datos = await Q.devolucionesDetalle(p, ctx); break;
     case "antiguedad": datos = await Q.antiguedadStock(p, ctx); break;
-    case "traspasos-hechos": datos = await Q.traspasosHechos(p, ctx); break;
+    case "traspasos-hechos": datos = await Q.traspasosHechos(p, ctx, q); break;
     case "margen": datos = await Q.margenProductos(p, ctx); break;
     case "efecto-precios": datos = await Q.efectoPrecios(p, ctx); break;
     case "productividad": datos = await Q.productividad(p, ctx); break;
@@ -444,7 +438,6 @@ async function manejar(req, res) {
       if (!A.PERMISOS[s.rol].includes("inventario")) return falla(res, 403, "Sin permiso de inventario.");
       const body = await leerJson(req);
       const aj = A.leer().ajustes;
-      Q.fijarAlmacenesOcultos(aj.almacenesOcultos);
       const r = await Q.resolverRango(p, "30", {});
       const ctx = { r, uid: null, rol: s.rol, aj, rolDe: A.rolDe };
       const modo = (url.searchParams.get("modo") || "") === "ajustes";
@@ -465,7 +458,6 @@ export function iniciar(puerto = 3000, opciones = {}) {
   if (opciones && (opciones.dir || opciones.cifrar || opciones.descifrar)) {
     A.configurarAlmacen(opciones);
   }
-  try { Q.fijarAlmacenesOcultos(A.leer().ajustes.almacenesOcultos); } catch {}
   Lic.configurarLicencia({
     dir: opciones?.dir,
     empaquetado: opciones?.empaquetado,

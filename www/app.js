@@ -1297,7 +1297,7 @@ vistas.perdidas = async () => {
         </table></div>
         <h4 style="margin-top:12px">Cambios de precio y eliminaciones</h4>
         ${(det.cambiosPrecio || []).slice(0, 15).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}
-        ${(det.productosEliminados || []).slice(0, 10).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}`}
+        ${(det.productosEliminados || []).slice(0, 10).map((x) => `<div class="fila"><div>${e(x.usuario)}<small>${e(x.mensaje)}</small></div><div class="d muted num">${e(x.fecha)}</div></div>`).join("")}`)}
       ${sec("07", "Fichas por persona", `<div class="scroll"><table>
           <tr><th>Nombre</th><th class="d">Ventas</th><th class="d">Anul.</th><th class="d">Faltante</th><th class="d">Sobrante</th><th class="d">Neto</th><th>Señales</th></tr>
           ${(d.fichasTrabajadores || []).map((f) => `<tr>

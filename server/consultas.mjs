@@ -222,14 +222,26 @@ export async function resumen(pool, ctx) {
       horasHoy: hoyHoras.map((x) => ({ hora: num(x.hora), total: num(x.total) })),
     },
   };
+  // Sin llamar a panelDueno (evita recursión panel ↔ resumen)
   try {
-    const [panel, alertas] = await Promise.all([
-      panelDueno(pool, ctx).catch(() => null),
-      alertasInicio(pool, ctx).catch(() => null),
-    ]);
-    base.panel = panel;
-    base.alertasInicio = alertas;
-  } catch (_) {}
+    base.alertasInicio = await alertasInicio(pool, ctx).catch(() => null);
+  } catch (_) {
+    base.alertasInicio = null;
+  }
+  base.panel = {
+    desde: base.desde,
+    hasta: base.hasta,
+    ultimoDia: base.ultimoDia,
+    ventasHoy: base.tiempoReal?.hoy ?? 0,
+    ventasPeriodo: base.total,
+    tickets: base.tickets,
+    ganancia: base.ganancia ?? null,
+    margen: base.margen ?? null,
+    caja: base.alertasInicio?.caja || { conDiferencia: 0, faltante: 0, sobrante: 0 },
+    stockCritico: [],
+    top: (base.top || []).slice(0, 5),
+    mermas: 0,
+  };
   return base;
 }
 
@@ -2618,24 +2630,30 @@ export async function alertasInicio(pool, ctx) {
 }
 
 export async function panelDueno(pool, ctx) {
+  // No llama a resumen() — evita bucle infinito resumen ↔ panelDueno
   const { desde, hasta, ultimo } = ctx.r;
-  const [res, cajaData, alertas, top, merma] = await Promise.all([
-    resumen(pool, ctx),
+  const U = uid(ctx);
+  const P = parRango(ctx, desde, hasta);
+  const [tot, hoyT, cajaData, alertas, top, merma] = await Promise.all([
+    una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} AND ${RANGO}${U}`, P),
+    una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total FROM operations o WHERE ${VENTA} AND DATE(${F}) = ?${U}`, ctx.uid != null ? [ultimo, ctx.uid] : [ultimo]),
     caja(pool, ctx, { pagina: 1 }),
     alertasStock(pool, ctx).catch(() => ({ resumen: { agotados: 0, reorden: 0 }, filas: [] })),
     topProductos(pool, ctx, { limite: 5 }),
     mermas(pool, ctx).catch(() => ({ total: 0 })),
   ]);
+  const total = num(tot.total);
+  const tickets = num(tot.tickets);
   return {
     desde, hasta, ultimoDia: ultimo,
-    ventasHoy: res.tiempoReal?.hoy ?? 0,
-    ventasPeriodo: res.total,
-    tickets: res.tickets,
-    ganancia: res.ganancia ?? null,
-    margen: res.margen ?? null,
+    ventasHoy: num(hoyT.total),
+    ventasPeriodo: total,
+    tickets,
+    ganancia: null,
+    margen: null,
     caja: { conDiferencia: cajaData.conDiferencia, faltante: cajaData.faltante, sobrante: cajaData.sobrante },
-    stockCritico: (alertas.filas || []).filter((x) => x.nivel === "alta").slice(0, 8),
-    top: top.filas || [],
+    stockCritico: (alertas.filas || []).filter((x) => x.nivel === "alta" || x.tipo === "agotado" || x.tipo === "minimo").slice(0, 8),
+    top: top.filas || top.top || [],
     mermas: merma.total || 0,
   };
 }

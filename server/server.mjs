@@ -345,8 +345,8 @@ async function consulta(res, nombre, s, p, q) {
     case "productividad": datos = await Q.productividad(p, ctx); break;
     case "patrones-anulacion": datos = await Q.patronesAnulacion(p, ctx); break;
     case "duracion-turnos": datos = await Q.duracionTurnos(p, ctx); break;
-    case "alertas-inicio": datos = (await Q.resumen(p, ctx)).alertasInicio || await Q.alertasInicio(p, ctx); break;
-    case "panel": datos = (await Q.resumen(p, ctx)).panel || await Q.panelDueno(p, ctx); break;
+    case "alertas-inicio": datos = await Q.alertasInicio(p, ctx); break;
+    case "panel": datos = await Q.panelDueno(p, ctx); break;
     case "comparar": datos = await Q.compararPeriodos(p, ctx, q); break;
     case "buscar": datos = await Q.busquedaGlobal(p, ctx, q); break;
     case "lista-arqueo": datos = await Q.listaArqueo(p, ctx, q); break;

@@ -4,7 +4,8 @@ const { pathToFileURL } = require("node:url");
 const { networkInterfaces } = require("node:os");
 
 // Una sola instancia: si ya corre en bandeja, al abrir de nuevo se muestra la ventana
-if (!app.requestSingleInstanceLock()) {
+const unicaInstancia = app.requestSingleInstanceLock();
+if (!unicaInstancia) {
   app.quit();
 }
 
@@ -35,7 +36,8 @@ function urlsMovil() {
 function icono() {
   const p = path.join(__dirname, "..", "build", "icon.png");
   try {
-    return nativeImage.createFromPath(p);
+    const img = nativeImage.createFromPath(p);
+    return img.isEmpty() ? img : img.resize({ width: 32, height: 32 });
   } catch {
     return nativeImage.createEmpty();
   }
@@ -131,6 +133,7 @@ async function arrancarServidor() {
 }
 
 app.whenReady().then(async () => {
+  if (!unicaInstancia) return; // ya hay otra copia en la bandeja: no arrancar un segundo servidor
   try {
     await arrancarServidor();
   } catch (e) {

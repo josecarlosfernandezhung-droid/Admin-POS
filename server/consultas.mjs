@@ -6,7 +6,7 @@ const F = "IF(o.UserRealTime BETWEEN '2020-01-01' AND '2036-12-31 23:59:59', o.U
 // PriceOut en Axis ya trae el precio cobrado; Discount es solo informativo (no volver a restar).
 const IMP = "(ABS(o.Qtty) * o.PriceOut)";
 // Sign -1 = venta finalizada en Axis; Sign 0 = sin finalizar / anulada en borrador
-const VENTA = "o.OperType = 2 AND COALESCE(o.Sign, 0) < 0";
+const VENTA = "o.OperType = 2 AND COALESCE(o.Sign, 0) < 0 AND o.Acct > 0";
 const DEVOL = "o.OperType = 34";
 const RANGO = `${F} >= ? AND ${F} < DATE_ADD(?, INTERVAL 1 DAY)`;
 const PRECIO = "COALESCE(NULLIF(g.PriceOut2,0), NULLIF(g.PriceOut1,0), NULLIF(g.PriceOut3,0), 0)";
@@ -103,7 +103,7 @@ const porHora = (pool, ctx, d, h) =>
   );
 
 // ---------- Resumen ----------
-export async function resumen(pool, ctx) {
+async function resumenBase(pool, ctx) {
   const { desde, hasta } = ctx.r;
   const U = uid(ctx);
   const P = parRango(ctx, desde, hasta);
@@ -222,26 +222,18 @@ export async function resumen(pool, ctx) {
       horasHoy: hoyHoras.map((x) => ({ hora: num(x.hora), total: num(x.total) })),
     },
   };
-  // Sin llamar a panelDueno (evita recursión panel ↔ resumen)
-  try {
-    base.alertasInicio = await alertasInicio(pool, ctx).catch(() => null);
-  } catch (_) {
-    base.alertasInicio = null;
-  }
-  base.panel = {
-    desde: base.desde,
-    hasta: base.hasta,
-    ultimoDia: base.ultimoDia,
-    ventasHoy: base.tiempoReal?.hoy ?? 0,
-    ventasPeriodo: base.total,
-    tickets: base.tickets,
-    ganancia: base.ganancia ?? null,
-    margen: base.margen ?? null,
-    caja: base.alertasInicio?.caja || { conDiferencia: 0, faltante: 0, sobrante: 0 },
-    stockCritico: [],
-    top: (base.top || []).slice(0, 5),
-    mermas: 0,
-  };
+  return base;
+}
+
+/** Resumen completo: cifras + panel del dueño + alertas. (resumenBase no vuelve a llamar al panel: evita el bucle infinito.) */
+export async function resumen(pool, ctx) {
+  const base = await resumenBase(pool, ctx);
+  const [panel, alertas] = await Promise.all([
+    panelDueno(pool, ctx, base).catch((e) => { console.error("panel", e.message); return null; }),
+    alertasInicio(pool, ctx).catch((e) => { console.error("alertasInicio", e.message); return null; }),
+  ]);
+  base.panel = panel;
+  base.alertasInicio = alertas;
   return base;
 }
 
@@ -1345,8 +1337,8 @@ export async function caja(pool, ctx, q) {
               SUM(CASE WHEN Mode = 1 THEN Qtty ELSE 0 END) AS efectivo,
               SUM(CASE WHEN Mode = 2 THEN Qtty ELSE 0 END) AS tarjeta,
               SUM(CASE WHEN Mode = 3 THEN Qtty ELSE 0 END) AS transfer,
-              SUM(CASE WHEN Mode NOT IN (1,2,3) THEN Qtty ELSE 0 END) AS otros,
-              SUM(Qtty) AS todos
+              SUM(CASE WHEN Mode > 3 THEN Qtty ELSE 0 END) AS otros,
+              SUM(CASE WHEN Mode > 0 THEN Qtty ELSE 0 END) AS todos
        FROM payments WHERE OperType = 2
        GROUP BY ShiftID
      ) pg ON pg.ShiftID = sh.ID
@@ -1386,8 +1378,8 @@ export async function caja(pool, ctx, q) {
                 SUM(CASE WHEN Mode = 1 THEN Qtty ELSE 0 END) AS efectivo,
                 SUM(CASE WHEN Mode = 2 THEN Qtty ELSE 0 END) AS tarjeta,
                 SUM(CASE WHEN Mode = 3 THEN Qtty ELSE 0 END) AS transfer,
-                SUM(CASE WHEN Mode NOT IN (1,2,3) THEN Qtty ELSE 0 END) AS otros,
-                SUM(Qtty) AS todos
+                SUM(CASE WHEN Mode > 3 THEN Qtty ELSE 0 END) AS otros,
+                SUM(CASE WHEN Mode > 0 THEN Qtty ELSE 0 END) AS todos
          FROM payments WHERE OperType = 2 GROUP BY ShiftID
        ) pg ON pg.ShiftID = sh.ID
        WHERE sh.DateTimeOpen >= ? AND sh.DateTimeOpen < DATE_ADD(?, INTERVAL 1 DAY)${filtroU}
@@ -1413,7 +1405,7 @@ export async function caja(pool, ctx, q) {
     const diferencia = difAxis != null ? redondear(difAxis) : difCalc;
     const sinContar = cerrado && contado === 0 && Math.abs(esperado) > 1;
     const pagosTodos = num(t.pagosTodos);
-    const difPagos = redondear(pagosTodos - (ventas - dev));
+    const difPagos = redondear(pagosTodos - ventas);
 
     // Cierres sin conteo: DiffClose de Axis ≈ todo el esperado; NO es faltante real.
     let nivel = "ok";
@@ -1472,7 +1464,8 @@ export async function caja(pool, ctx, q) {
   });
 
   const ventasTot = turnos.reduce((s, t) => s + t.ventas, 0);
-  const conDif = turnos.filter((t) => !t.sinContar && t.diferencia != null && Math.abs(t.diferencia) > tol);
+  const conteo = turnos.filter((t) => !t.sinContar && t.diferencia != null);
+  const conDif = conteo.filter((t) => Math.abs(t.diferencia) > tol);
   const paginas = Math.max(Math.ceil(turnos.length / 20), 1);
 
   const porCajeroMap = new Map();
@@ -1534,8 +1527,9 @@ export async function caja(pool, ctx, q) {
     turnos: turnos.length,
     conDiferencia: conDif.length,
     cerradosSinContar: turnos.filter((t) => t.sinContar).length,
-    faltante: redondear(conDif.filter((t) => t.diferencia > 0).reduce((s, t) => s + t.diferencia, 0)),
-    sobrante: redondear(conDif.filter((t) => t.diferencia < 0).reduce((s, t) => s + Math.abs(t.diferencia), 0)),
+    // Faltante/sobrante = suma de TODOS los turnos con conteo (igual que la tabla por cajero); «conDiferencia» cuenta solo los que pasan la tolerancia.
+    faltante: redondear(conteo.filter((t) => t.diferencia > 0).reduce((s, t) => s + t.diferencia, 0)),
+    sobrante: redondear(conteo.filter((t) => t.diferencia < 0).reduce((s, t) => s + Math.abs(t.diferencia), 0)),
     sinCuadrar: turnos.filter((t) => Math.abs(t.difPagos) > 1 && t.ventas > 0).length,
     tolerancia: tol,
     nota:
@@ -1869,12 +1863,16 @@ export async function eventos(pool, ctx, q) {
         break;
       }
     }
+    // Venta anulada: AxisPOS la borra de operations, pero el número queda en el mensaje del log.
+    const anul = !ticketInfo && /Anular venta No\.?\s*0*(\d{3,12})/i.exec(msg);
+    if (anul) ticketInfo = { ticket: numTicket(parseInt(anul[1], 10)), fecha: null, total: null, cajero: null, anulado: true };
     return {
       id: x.id,
       fecha: x.fecha,
       usuario: x.usuario || "—",
       mensaje: msg.slice(0, 220),
       acct,
+      anulado: !!(ticketInfo && ticketInfo.anulado),
       ticket: ticketInfo ? ticketInfo.ticket : null,
       ticketTotal: ticketInfo ? ticketInfo.total : null,
       ticketFecha: ticketInfo ? ticketInfo.fecha : null,
@@ -2629,31 +2627,25 @@ export async function alertasInicio(pool, ctx) {
   return { items, caja: { conDiferencia: cajaData.conDiferencia, faltante: cajaData.faltante }, stock: alertas.resumen || {} };
 }
 
-export async function panelDueno(pool, ctx) {
-  // No llama a resumen() — evita bucle infinito resumen ↔ panelDueno
+export async function panelDueno(pool, ctx, resPrevio = null) {
   const { desde, hasta, ultimo } = ctx.r;
-  const U = uid(ctx);
-  const P = parRango(ctx, desde, hasta);
-  const [tot, hoyT, cajaData, alertas, top, merma] = await Promise.all([
-    una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total, COUNT(DISTINCT o.Acct) AS tickets FROM operations o WHERE ${VENTA} AND ${RANGO}${U}`, P),
-    una(pool, `SELECT COALESCE(SUM(${IMP}),0) AS total FROM operations o WHERE ${VENTA} AND DATE(${F}) = ?${U}`, ctx.uid != null ? [ultimo, ctx.uid] : [ultimo]),
+  const [res, cajaData, alertas, top, merma] = await Promise.all([
+    resPrevio || resumenBase(pool, ctx),
     caja(pool, ctx, { pagina: 1 }),
     alertasStock(pool, ctx).catch(() => ({ resumen: { agotados: 0, reorden: 0 }, filas: [] })),
     topProductos(pool, ctx, { limite: 5 }),
     mermas(pool, ctx).catch(() => ({ total: 0 })),
   ]);
-  const total = num(tot.total);
-  const tickets = num(tot.tickets);
   return {
     desde, hasta, ultimoDia: ultimo,
-    ventasHoy: num(hoyT.total),
-    ventasPeriodo: total,
-    tickets,
-    ganancia: null,
-    margen: null,
+    ventasHoy: res.tiempoReal?.hoy ?? 0,
+    ventasPeriodo: res.total,
+    tickets: res.tickets,
+    ganancia: res.ganancia ?? null,
+    margen: res.margen ?? null,
     caja: { conDiferencia: cajaData.conDiferencia, faltante: cajaData.faltante, sobrante: cajaData.sobrante },
-    stockCritico: (alertas.filas || []).filter((x) => x.nivel === "alta" || x.tipo === "agotado" || x.tipo === "minimo").slice(0, 8),
-    top: top.filas || top.top || [],
+    stockCritico: (alertas.filas || []).filter((x) => x.nivel === "alta").slice(0, 8),
+    top: top.filas || [],
     mermas: merma.total || 0,
   };
 }
@@ -3041,7 +3033,7 @@ export async function informeAuditoria(pool, ctx) {
   ]);
 
   const parciales = (cajaData.filas || []).filter((t) => t.sinContar || (t.contado === 0 && Math.abs(t.esperado || 0) > 1));
-  const conDif = (cajaData.filas || []).filter((t) => t.nivel === "media" || t.nivel === "alta");
+  const conDif = (cajaData.filas || []).filter((t) => !t.sinContar && (t.nivel === "media" || t.nivel === "alta"));
 
   // Fichas por trabajador
   const mapa = new Map();

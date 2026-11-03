@@ -281,7 +281,7 @@ async function ajustesPost(req, res, ruta, s, p) {
 // ---------- Consultas con permiso ----------
 const MODULO = {
   resumen: "resumen", ventas: "ventas", "ventas-modo": "ventas", ticket: "ventas", "ventas-dia": "ventas",
-  productos: "productos", top: "productos", "prod-tx": "productos", "cambios-precio": "productos", margen: "productos", "efecto-precios": "productos",
+  productos: "productos", "productos-modo": "productos", top: "productos", "prod-tx": "productos", "cambios-precio": "productos", margen: "productos", "efecto-precios": "productos",
   existencias: "existencias", caja: "caja", equipo: "equipo", "equipo-modo": "equipo", productividad: "equipo", "duracion-turnos": "equipo", ranking: "equipo", "turnos-horario": "equipo",
   alertas: "inventario", "inventario-modo": "inventario", abc: "inventario", compras: "inventario", ipv: "inventario", "historial-mercancia": "inventario", traspasos: "inventario",
   antiguedad: "inventario", "traspasos-hechos": "inventario", fisico: "inventario", "lista-arqueo": "inventario",
@@ -290,8 +290,20 @@ const MODULO = {
   "alertas-inicio": "resumen", panel: "resumen", comparar: "resumen", buscar: "resumen",
 };
 
+// Datos del dueño (costos, márgenes, panel general): el cajero no los ve ni por la API.
+const SOLO_DUENO = new Set(["margen", "efecto-precios", "cambios-precio", "panel", "comparar", "abc", "compras", "ipv", "traspasos", "traspasos-hechos", "antiguedad", "historial-mercancia", "lista-arqueo"]);
+const MODOS_DUENO = new Set(["abc", "compras", "antiguedad", "ipv", "traspasos", "hechos", "traspasos-hechos", "lista-arqueo", "arqueo", "margen"]);
+function sinCostos(d) {
+  const quitar = (o) => { if (o && typeof o === "object") for (const k of ["costo", "ganancia", "margen", "costoPorPeso", "descuentos"]) delete o[k]; };
+  quitar(d);
+  for (const k of ["top", "familias"]) if (Array.isArray(d[k])) d[k].forEach(quitar);
+  delete d.panel;
+  return d;
+}
+
 async function consulta(res, nombre, s, p, q) {
   if (!A.PERMISOS[s.rol].includes(MODULO[nombre] || "conteos") && nombre !== "conteos") return falla(res, 403, "Tu rol no tiene acceso a esta sección.");
+  if (s.rol === "cajero" && (SOLO_DUENO.has(nombre) || ((nombre === "productos-modo" || nombre === "inventario-modo") && MODOS_DUENO.has(q.modo)))) return falla(res, 403, "Tu rol no tiene acceso a esta sección.");
   const aj = A.leer().ajustes;
   const r = await Q.resolverRango(p, q.periodo, q);
   // Admin puede filtrar por cajero/local; cajero siempre ve solo lo suyo
@@ -311,7 +323,7 @@ async function consulta(res, nombre, s, p, q) {
   };
   let datos;
   switch (nombre) {
-    case "resumen": datos = { ...(await Q.resumen(p, ctx)), tasa: aj.tasa }; break;
+    case "resumen": datos = { ...(await Q.resumen(p, ctx)), tasa: aj.tasa }; if (s.rol === "cajero") datos = sinCostos(datos); break;
     case "ventas": datos = await Q.ventas(p, ctx, q); break;
     case "ventas-modo": datos = await Q.ventasModo(p, ctx, q); break;
     case "ventas-dia": datos = await Q.ventasModo(p, ctx, { ...q, modo: "dia" }); break;
@@ -454,7 +466,7 @@ async function manejar(req, res) {
     }
     // Importar conteo físico (JSON exportado desde Arqueo Stock)
     if (ruta === "/api/fisico" && req.method === "POST") {
-      if (!A.PERMISOS[s.rol].includes("inventario")) return falla(res, 403, "Sin permiso de inventario.");
+      if (s.rol === "cajero" || !A.PERMISOS[s.rol].includes("inventario")) return falla(res, 403, "Sin permiso de inventario.");
       const body = await leerJson(req);
       const aj = A.leer().ajustes;
       const r = await Q.resolverRango(p, "30", {});

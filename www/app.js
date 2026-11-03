@@ -11,6 +11,27 @@ const SS = {
   set: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} },
   del: (k) => { try { sessionStorage.removeItem(k); } catch {} },
 };
+// Caché de la última respuesta por usuario y ruta (para mostrar datos si se cae la red). Si el almacenamiento falla, usa memoria.
+const CACHE = (() => {
+  const mem = new Map();
+  const clave = (ruta) => "apos:c:" + (S.yo ? S.yo.id : "x") + ":" + ruta;
+  return {
+    get(ruta) {
+      const k = clave(ruta);
+      if (mem.has(k)) return mem.get(k);
+      try { const t = localStorage.getItem(k); return t ? JSON.parse(t) : null; } catch { return null; }
+    },
+    set(ruta, _, data) {
+      const k = clave(ruta);
+      const reg = { t: Date.now(), data };
+      mem.set(k, reg);
+      if (mem.size > 60) mem.delete(mem.keys().next().value);
+      try { localStorage.setItem(k, JSON.stringify(reg)); } catch {
+        try { Object.keys(localStorage).filter((x) => x.startsWith("apos:c:")).forEach((x) => localStorage.removeItem(x)); } catch {}
+      }
+    },
+  };
+})();
 const S = { base: "", token: "", yo: null, periodo: LS.get("periodoPref") || "hoy", desde: "", hasta: "", vista: "resumen", estado: null, conteos: {}, tk: 0,
   ventas: { q: "", pagina: 1, sub: "tickets" }, prod: { q: "", familia: "", orden: "vendidos", activos: true, pagina: 1, sub: "lista" }, exis: { q: "", local: "", pagina: 1 },
   cajaPag: 1, filtroUsuario: "", filtroLocal: "", usuariosFiltro: [], localesFiltro: [], invSub: "alertas", abcClase: "A", perSub: "informe", ev: { tipo: "cancel", usuario: "", nombre: "", pagina: 1 }, pagCb: null,
@@ -40,14 +61,11 @@ function paramsPeriodo(extra = {}) {
 }
 
 async function cargarFiltrosGlobales() {
+  if (S.yo && S.yo.rol === "cajero") return; // el cajero solo ve lo suyo: no hay filtros
   try {
     const d = await get("/api/equipo", paramsPeriodo({}));
     S.usuariosFiltro = (d.cajeros || []).map((x) => ({ id: x.id, nombre: x.nombre }));
   } catch { S.usuariosFiltro = []; }
-  try {
-    const d = await get("/api/inventario-modo", paramsPeriodo({ modo: "existencias", pagina: 1 }));
-    // locales may not be here — try ipv
-  } catch {}
   try {
     const d = await get("/api/ipv", paramsPeriodo({}));
     S.localesFiltro = (d.locales || []).map((x) => ({ id: x.id, nombre: x.nombre }));
@@ -784,7 +802,7 @@ async function renderProductosDentroVentas(tabs) {
     if (!aqui(tk)) return;
     $("#contenido").innerHTML = `${cab("Ventas", "Cambios de precio en ventas.")}${tabs}
       <div class="tarjeta"><div class="scroll"><table><tr><th>Producto</th><th>Detalle</th></tr>
-      ${(d.filas||[]).map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(String(x.precios||x.detalle||x.mensaje||""))}</td></tr>`).join("")||'<tr><td colspan="2" class="muted">Sin cambios</td></tr>'}
+      ${(d.filas||[]).map((x) => `<tr><td>${e(x.nombre)}</td><td class="muted">${e(Array.isArray(x.precios) ? x.precios.map((p) => `${fmt(p.precio, 0)} ×${fmt(p.unidades, 0)}`).join(" · ") + (x.variacionPct != null ? ` (variación ${fmt(x.variacionPct * 100, 0)} %)` : "") : String(x.detalle||x.mensaje||""))}</td></tr>`).join("")||'<tr><td colspan="2" class="muted">Sin cambios</td></tr>'}
       </table></div></div>`;
     return;
   }
@@ -795,14 +813,13 @@ async function renderProductosDentroVentas(tabs) {
     <select data-in="ordenProd">${[["vendidos","Más vendidos"],["nombre","Nombre"],["stock","Stock"],["precio","Precio"]].map(([v,n])=>`<option value="${v}" ${S.prod.orden===v?"selected":""}>${n}</option>`).join("")}</select>
     </div><div id="lista"></div></div>`;
   S.pagCb = (n) => { S.prod.pagina = n; vistas.ventas(); };
-  $("#lista").innerHTML = `<div class="scroll"><table><tr><th>Producto</th><th class="d">Stock</th><th class="d">Precio</th><th class="d">Vendido</th></tr>
-    ${(d.filas||[]).map((x)=>`<tr class="clic" data-act="prodTx" data-id="${x.id}" style="cursor:pointer"><td>${e(x.nombre)}<small>${e(x.codigo||"")}</small></td><td class="d num">${fmt(x.stock,1)}</td><td class="d num">${cup(x.precio)}</td><td class="d num">${cup(x.vendido||x.importe||0)}</td></tr>`).join("")}
-    </table></div>${pager(d.pagina, d.paginas)}`;
+  $("#lista").innerHTML = htmlListaProd(d);
 }
+
 
 vistas.ventas = async () => {
   const tk = S.tk;
-  const tabs = subTabs([["tickets", "Tickets"], ["dia", "Por día"], ["catalogo", "Catálogo"], ["top", "Top"], ["margen", "Margen"], ["precios", "Precios"]], S.ventas.sub, "ventasSub");
+  const tabs = subTabs([["tickets", "Tickets"], ["dia", "Por día"], ["catalogo", "Catálogo"], ["top", "Top"], ...(S.yo.rol === "cajero" ? [] : [["margen", "Margen"], ["precios", "Precios"]])], S.ventas.sub, "ventasSub");
   if (["catalogo", "top", "margen", "precios"].includes(S.ventas.sub)) {
     const prev = S.prod.sub;
     S.prod.sub = S.ventas.sub === "catalogo" ? "lista" : S.ventas.sub;
@@ -832,6 +849,50 @@ vistas.ventas = async () => {
   S.pagCb = (n) => { S.ventas.pagina = n; listaVentas(); };
   await listaVentas(tk);
 };
+const htmlListaProd = (d) => `<div class="scroll"><table><tr><th>Producto</th><th class="d">Stock</th><th class="d">Precio</th><th class="d">Vendido</th></tr>
+    ${(d.filas||[]).map((x)=>`<tr class="clic" data-act="prodTx" data-id="${x.id}" style="cursor:pointer"><td>${e(x.nombre)}<small>${e(x.codigo||"")}</small></td><td class="d num">${fmt(x.stock,1)}</td><td class="d num">${cup(x.precio)}</td><td class="d num">${cup(x.vendido||x.importe||0)}</td></tr>`).join("")}
+    </table></div>${pager(d.pagina, d.paginas)}`;
+
+async function recargarProd() {
+  const tk = S.tk;
+  try {
+    const d = await get("/api/productos-modo", paramsPeriodo({ modo: "lista", q: S.prod.q, familia: S.prod.familia, orden: S.prod.orden, activos: S.prod.activos ? 1 : 0, pagina: S.prod.pagina }));
+    if (!aqui(tk) || !$("#lista")) return;
+    S.pagCb = (n) => { S.prod.pagina = n; vistas.ventas(); };
+    $("#lista").innerHTML = htmlListaProd(d);
+  } catch (err) { aviso(err.message); }
+}
+
+// Existencias: vuelve a pintar la vista conservando el cursor en la casilla de búsqueda.
+async function recargarExis(origen) {
+  const act = origen && origen.dataset && origen.dataset.in ? origen : document.activeElement;
+  const clave = act && act.dataset ? act.dataset.in : null;
+  const pos = clave && typeof act.selectionStart === "number" ? act.selectionStart : null;
+  await vista(true);
+  if (!clave) return;
+  const nuevo = document.querySelector(`[data-in="${clave}"]`);
+  if (nuevo) { nuevo.focus(); if (pos != null && nuevo.setSelectionRange) try { nuevo.setSelectionRange(pos, pos); } catch {} }
+}
+
+// Ventas de un producto en el período (ventana con páginas)
+async function abrirProdTx(id, pagina = 1) {
+  try {
+    const d = await get("/api/prod-tx", paramsPeriodo({ id, pagina }));
+    if (d.error) return aviso(d.error);
+    const p = d.producto || {};
+    abrirModal(`<div class="panel"><header><div>
+        <span class="muted">${e(p.familia || "")}</span>
+        <h2>${e(p.nombre || "Producto")}</h2>
+        <span class="muted">${e(p.codigo || "")} · ${rangoTxt(d)}</span>
+      </div><button class="cerrar" data-act="cerrarModal">✕</button></header>
+      <div class="cuerpo">
+        <div class="kpis"><div class="kpi"><span>Unidades</span><b class="num">${fmt(d.unidades, 1)}</b></div><div class="kpi"><span>Importe</span><b class="num">${cup(d.importe)}</b></div><div class="kpi"><span>Tickets</span><b class="num">${fmt(d.tickets, 0)}</b></div></div>
+        ${(d.filas || []).map((x) => `<div class="fila clic" data-act="ticket" data-acct="${x.acct}" style="cursor:pointer"><div><span class="link num">${x.ticket}</span><small>${fechaHora(x.fecha)} · ${e(x.cajero)}${x.socio ? " · " + e(x.socio) : ""}</small></div><div class="d num">${fmt(x.cant, 2)} × ${cup(x.precio)}${x.descuento ? `<small>desc. ${fmt(x.descuento, 1)} %</small>` : ""}<small>${cup(x.importe)}</small></div></div>`).join("") || '<p class="muted">Sin ventas de este producto en el período.</p>'}
+        <div class="pag"><button data-act="prodTxPag" data-id="${id}" data-n="${d.pagina - 1}" ${d.pagina <= 1 ? "disabled" : ""}>Anterior</button><span>${d.pagina} / ${d.paginas}</span><button data-act="prodTxPag" data-id="${id}" data-n="${d.pagina + 1}" ${d.pagina >= d.paginas ? "disabled" : ""}>Siguiente</button></div>
+      </div></div>`, "");
+  } catch (err) { aviso(err.message); }
+}
+
 async function listaVentas() {
   const tk = S.tk;
   const d = await get("/api/ventas", paramsPeriodo({ q: S.ventas.q, pagina: S.ventas.pagina }));
@@ -1036,9 +1097,11 @@ const TIPO_ALERTA = { agotado: "Agotado", minimo: "Bajo mínimo", reorden: "Repo
 
 vistas.inventario = async () => {
   const tk = S.tk;
+  if (S.yo.rol === "cajero" && !["alertas", "existencias"].includes(S.invSub)) S.invSub = "alertas";
   const tabs = subTabs([
     ["alertas", "Alertas"],
     ["existencias", "Existencias"],
+    ...(S.yo.rol === "cajero" ? [] : [
     ["ipv", "IPV"],
     ["traspasos", "Sugeridos"],
     ["hechos", "Histórico"],
@@ -1046,6 +1109,7 @@ vistas.inventario = async () => {
     ["compras", "Compras"],
     ["antiguedad", "Antigüedad"],
     ["arqueo", "Arqueo"],
+    ]),
   ], S.invSub, "invSub");
   let cuerpo = "";
   if (S.invSub === "alertas") {
@@ -1424,7 +1488,7 @@ vistas.perdidas = async () => {
     cuerpo = `<div class="tarjeta"><div class="filtros"><select data-in="tipoEv">${TIPOS_EV.map(([v, n]) => `<option value="${v}" ${S.ev.tipo === v ? "selected" : ""}>${n}</option>`).join("")}</select>${S.ev.usuario ? `<button class="btn sec chico" data-act="quitarUsuarioEv">Solo ${e(S.ev.nombre)} ✕</button>` : ""}</div>
       <p class="muted" style="margin:0 0 6px">${fmt(d.total, 0)} eventos en el período. Toca un evento con ticket para ver la venta original.</p>
       ${d.filas.map((x) => `<div class="fila ${x.acct ? "clic" : ""}" ${x.acct ? `data-act="ticket" data-acct="${x.acct}" style="cursor:pointer"` : ""}>
-        <div>${e(x.usuario)}${x.ticket ? ` · <span class="link">Ticket ${x.ticket}</span>${x.ticketTotal != null ? ` · ${cup(x.ticketTotal)}` : ""}` : ""}
+        <div>${e(x.usuario)}${x.ticket ? ` · <span class="link">Ticket ${x.ticket}${x.anulado ? " (anulado)" : ""}</span>${x.ticketTotal != null ? ` · ${cup(x.ticketTotal)}` : ""}` : ""}
           <small>${e(x.mensaje)}</small></div>
         <div class="d muted num">${fechaHora(x.fecha + ":00")}</div></div>`).join("") || '<p class="muted">Sin eventos.</p>'}${pager(d.pagina, d.paginas)}</div>`;
   }
@@ -1972,13 +2036,13 @@ const ENT = {
     // Solo guarda el texto; en IPV no se repinta al teclear (se aplica con "Aplicar")
     S.exis.q = el.value; S.exis.pagina = 1;
     if (S.vista === "inventario" && (S.invSub === "ipv" || S.invSub === "traspasos")) return;
-    recargarExis();
+    recargarExis(el);
   },
   localExis: (el) => {
     S.exis.local = el.value; S.exis.pagina = 1;
     if (S.vista === "inventario" && S.invSub === "ipv") return; // Aplicar al cambiar o botón
     if (S.vista === "inventario" && S.invSub === "traspasos") { vista(true); return; }
-    recargarExis();
+    recargarExis(el);
   },
   origenTr: (el) => { S.exis.origen = el.value; },
   destinoTr: (el) => { S.exis.destino = el.value; },
